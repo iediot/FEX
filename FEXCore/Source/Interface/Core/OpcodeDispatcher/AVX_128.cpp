@@ -869,9 +869,7 @@ void OpDispatchBuilder::AVX128_MOVMSK(OpcodeArgs, IR::OpSize ElementSize) {
     auto GPRHigh = Mask4Byte(Src.High);
     GPR = _Orlshl(OpSize::i64Bit, GPRLow, GPRHigh, 4);
   } else {
-    auto GPRLow = Mask8Byte(Src.Low);
-    auto GPRHigh = Mask8Byte(Src.High);
-    GPR = _Orlshl(OpSize::i64Bit, GPRLow, GPRHigh, 2);
+    GPR = Mask4Byte(_VUnZip2(OpSize::i128Bit, OpSize::i32Bit, Src.Low, Src.High));
   }
   StoreResultGPR_WithOpSize(Op, Op->Dest, GPR, GetGPROpSize());
 }
