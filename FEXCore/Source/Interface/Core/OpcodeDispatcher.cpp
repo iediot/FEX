@@ -816,11 +816,11 @@ void OpDispatchBuilder::LoopOp(OpcodeArgs) {
     OpSize = OpSize::i32Bit;
   }
 
-  uint64_t Target = Op->PC + Op->InstSize + Op->Src[1].Literal();
+  uint64_t Target = Op->PC + Op->InstSize + Op->Src[0].Literal();
 
-  Ref CondReg = LoadSourceGPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags);
+  Ref CondReg = LoadGPRRegister(X86State::REG_RCX, SrcSize);
   CondReg = Sub(OpSize, CondReg, 1);
-  StoreResultGPR(Op, Op->Src[0], CondReg);
+  StoreGPRRegister(X86State::REG_RCX, CondReg, SrcSize);
 
   // If LOOPE then jumps to target if RCX != 0 && ZF == 1
   // If LOOPNE then jumps to target if RCX != 0 && ZF == 0
@@ -849,7 +849,7 @@ void OpDispatchBuilder::LoopOp(OpcodeArgs) {
       StartNewBlock();
 
       // Store the new RIP
-      ExitRelocatedPC(Op, Op->Src[1].Literal());
+      ExitRelocatedPC(Op, Op->Src[0].Literal());
     }
 
     // Failure to take branch
