@@ -25,7 +25,7 @@ CallRetStackInfo GetInfoThread(FEXCore::Core::InternalThreadState* Thread) {
   uint64_t Base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
   // Leave some room from the base for the default location to allow for underflows without constant exceptions
   return {Base - FEXCore::Utils::FEX_PAGE_SIZE, Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + FEXCore::Utils::FEX_PAGE_SIZE,
-          Base + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4};
+          Base + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET};
 }
 
 /* Returns false if the call-ret stack could not be placed.

@@ -119,7 +119,10 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // observed in Thumper FMOD worker, the original 4MB filled up. 16MB buys
   // ~1M entries — enough to survive normal game runtimes that have a few
   // hundred per-thread caught faults. Real fix: callret-aware SEH unwind.
-  static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
+  /* madeira-bcd: 8 MiB call-return stack (tools/patch-fex-ios-callret-8mb.py): every JIT
+   * access stays in [2 MiB, 6 MiB), so 16 MiB reserved 10 MiB that
+   * nothing touches, per thread, in a 12 GB FEX arena. */
+  static constexpr size_t CALLRET_STACK_SIZE {0x800000};
 
   // iOS-Madeira ml609/ml610: NAMED bounds for the window the CALL/RET guard enforces.
   //
@@ -148,9 +151,9 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   //       and shrinking it strands the remainder resident.
   //
   // Clear CALLRET_STACK_SIZE. These constants describe the guard, not the cost.
-  static constexpr size_t CALLRET_DEFAULT_OFFSET {CALLRET_STACK_SIZE / 4};        // 4MB: initial sp
-  static constexpr size_t CALLRET_LIVE_OFFSET {CALLRET_STACK_SIZE / 8};           // 2MB: guard low bound
-  static constexpr size_t CALLRET_LIVE_SIZE {CALLRET_STACK_SIZE / 4};             // 4MB: guard window [2MB,6MB)
+  static constexpr size_t CALLRET_DEFAULT_OFFSET {0x400000};        // 4MB: initial sp
+  static constexpr size_t CALLRET_LIVE_OFFSET {0x200000};           // 2MB: guard low bound
+  static constexpr size_t CALLRET_LIVE_SIZE {0x400000};             // 4MB: guard window [2MB,6MB)
 
   // The low address of the call-ret stack allocation (not including guard pages)
   void* CallRetStackBase {};

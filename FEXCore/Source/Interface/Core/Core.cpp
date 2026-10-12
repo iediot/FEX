@@ -1952,7 +1952,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           }
           LogMan::Msg::EFmt("[callret-chain] #{:<2} guest_ret={:#x} host={:#x}", i, GuestRet, HostRet);
         }
-        LogMan::Msg::EFmt("[callret-chain] depth_used={:#x} nonzero={} (sp={:#x} base={:#x})", CRBase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4 - CRSp,
+        LogMan::Msg::EFmt("[callret-chain] depth_used={:#x} nonzero={} (sp={:#x} base={:#x})", CRBase + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET - CRSp,
                           NonZero, CRSp, CRBase);
       }
     }
@@ -1988,7 +1988,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     if (crbase != 0 && (crsp < crbase || crsp >= crend)) {
       static volatile uint32_t oob_cnt = 0;
       uint32_t n = __sync_add_and_fetch(&oob_cnt, 1);
-      uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE / 4;
+      uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
       const char *kind = (crsp < crbase) ? "UNDERFLOW" : "OVERFLOW";
       if (n <= 16) {
         LogMan::Msg::EFmt("[CALLRET_OOB #{}] {} callret_sp=0x{:x}  "
