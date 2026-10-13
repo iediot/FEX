@@ -10,6 +10,7 @@ $end_info$
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include "Interface/Core/LookupCache.h"
+#include "Interface/Core/CPUBackend.h"
 
 #include <array>
 #include <algorithm>
@@ -24,6 +25,7 @@ $end_info$
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/fextl/set.h>
+#include <fmt/ranges.h>
 
 namespace FEXCore::Frontend {
 #include "Interface/Core/VSyscall/VSyscall.inc"
@@ -1184,7 +1186,16 @@ void Decoder::BranchTargetInMultiblockRange() {
   bool ValidMultiblockMember = TargetRIP >= EntryPoint && TargetRIP < std::min(InstEnd + MAX_FORWARD_BRANCH_DIST, SectionMaxAddress);
 
 #ifdef ARCHITECTURE_arm64ec
-  ValidMultiblockMember = ValidMultiblockMember && !RtlIsEcCode(TargetRIP);
+  if (ValidMultiblockMember) {
+    const bool TargetIsEc = RtlIsEcCode(TargetRIP);
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+    // iOS-Madeira ml2400: decides what the block contains; recorded for the persistent code cache.
+    if (Thread && Thread->CPUBackend && Thread->CPUBackend->MadeiraCapture.Active) {
+      MadeiraCache::NoteEcQuery(Thread, MadeiraCache::EcQueryKind::FrontendMultiblock, TargetRIP, TargetIsEc);
+    }
+#endif
+    ValidMultiblockMember = !TargetIsEc;
+  }
 #endif
 
   if (ValidMultiblockMember) {
@@ -1608,6 +1619,15 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
                                                                                              "PartialDecode",
                             OpAddress);
+          // [iOS-Madeira] The bytes FEX refused, and the block's first bytes: tells a real
+          // unsupported x86 instruction from code that was not (fully) written yet.
+          static int BadBytesLogged;
+          if (BadBytesLogged++ < 8) {
+            const uint8_t* Bad = InstStream.AdjustedInstStream;
+            const uint8_t* Entry = Bad - (OpAddress - RIPToDecode);
+            LogMan::Msg::EFmt("[decode-fail] at {:X}: {:02x} | block {:X}: {:02x}", OpAddress,
+                              fmt::join(Bad, Bad + 16, " "), RIPToDecode, fmt::join(Entry, Entry + 16, " "));
+          }
         }
         break;
       }

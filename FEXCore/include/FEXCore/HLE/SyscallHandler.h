@@ -73,6 +73,15 @@ public:
 
   virtual void SleepThread(FEXCore::Context::Context* CTX, FEXCore::Core::CpuStateFrame* Frame) {}
 
+  // iOS-Madeira: store Value (Size 4 or 8 bytes) to the host address Address, which may sit on a
+  // page the frontend has write-trapped for SMC detection, without faulting. The caller holds
+  // CodeInvalidationMutex exclusively; the implementation must not take ThreadCreationMutex
+  // (lock order). Returns false when it did not store (the caller then stores directly).
+  // Last in the interface so existing vtable slots keep their positions.
+  virtual bool WriteUntrackedLocked(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint8_t Size, uint64_t Value) {
+    return false;
+  }
+
 protected:
   SyscallOSABI OSABI;
 };

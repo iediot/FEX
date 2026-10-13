@@ -30,9 +30,21 @@ struct IosAliasEntry {
   uint64_t PeBase;
   uint64_t JitBase;
   uint64_t Size;
-  uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
+  uint64_t Generation;  // Odd while an entry is changing; also keeps a 32-byte stride.
 };
-constexpr int kMaxEntries = 256;
+struct alignas(16) IosAliasCacheEntry {
+  uint64_t Tag;    // address page in bits 16..63, even generation in bits 0..15
+  uint64_t Delta;  // added to the address on a hit
+};
+/* iOS-Madeira ml1201: 256 -> 2048. FEX is ONE module shared by every x64
+ * pseudo-process, and nothing retires an entry when its process exits (only an
+ * overlapping re-registration does), so steam.exe + steamwebhelper (libcef and
+ * its ~100 dependencies) + a game filled all 256 slots. The table then refused
+ * the game's next image (shlwapi.dll) and the game died a few calls later:
+ * "[jit-alias] ml1106 IosAliasEntries FULL" at the same load in every launch.
+ * Module.S and the C++ walks bound on IosAliasCount, not on this size, so a
+ * larger array costs 64KB of .bss and nothing per call. */
+constexpr int kMaxEntries = 2048;
 
 // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
 // can reach the table via adrp/:lo12: — it translates the branch target
@@ -41,19 +53,101 @@ constexpr int kMaxEntries = 256;
 extern "C" {
 IosAliasEntry IosAliasEntries[kMaxEntries];
 volatile int IosAliasCount = 0;
-/* ml1116: the entry that satisfied the last translation, checked first by
- * Module.S before the walk. A pointer (one atomic 8-byte store) rather than a
- * copy of the fields, so a reader can never see a torn entry; a retired entry
- * has Size 0 and simply misses. The walk itself now runs NEWEST-FIRST: the
- * images the game calls (its own EC ntdll/kernel32/kernelbase, the D3D12
- * runtime) are registered late, so oldest-first cost ~150 iterations per
- * x64->EC call at up to a million calls a second. */
-IosAliasEntry* volatile IosAliasLast = nullptr;
+/* iOS-Madeira ml1132: registration populates these direct caches; transition
+ * readers only load them. A repeated tag read is the seqlock, so remaps cannot
+ * expose a new tag with an old delta. Collisions fall back to the exact table. */
+IosAliasCacheEntry IosAliasPeCache[16384];
+IosAliasCacheEntry IosAliasJitCache[16384];
+extern uint64_t IosXpFex[];
 }
 
 namespace {
 IosAliasEntry* const g_Entries = IosAliasEntries;
 volatile int& g_EntryCount = IosAliasCount;
+constexpr uint64_t kCacheMask = 16384 - 1;
+std::atomic_flag g_UpdateLock = ATOMIC_FLAG_INIT;
+
+struct UpdateLock {
+  UpdateLock() {
+    while (g_UpdateLock.test_and_set(std::memory_order_acquire)) {}
+  }
+  ~UpdateLock() { g_UpdateLock.clear(std::memory_order_release); }
+};
+
+void CachePublishEntry(IosAliasCacheEntry& Entry, uint64_t Page, uint64_t Delta) {
+  const uint64_t Old = __atomic_load_n(&Entry.Tag, __ATOMIC_RELAXED);
+  uint64_t Generation = (Old + 2) & 0xfffe;
+  if (!Generation) {
+    Generation = 2;
+  }
+  __atomic_store_n(&Entry.Tag, Old | 1, __ATOMIC_RELEASE);
+  __atomic_store_n(&Entry.Delta, Delta, __ATOMIC_RELAXED);
+  __atomic_store_n(&Entry.Tag, (Page << 16) | Generation, __ATOMIC_RELEASE);
+}
+
+void CachePublish(IosAliasCacheEntry* Cache, uint64_t Page, uint64_t Delta) {
+  CachePublishEntry(Cache[Page & kCacheMask], Page, Delta);
+}
+
+void CacheRemove(IosAliasCacheEntry* Cache, uint64_t Base, uint64_t Size, uint64_t Delta) {
+  if (!Size) return;
+  /* Only whole 64KB pages are cached. A partial edge page needs the exact
+   * range check in the fallback table or a nearby non-image address could hit. */
+  const uint64_t First = (Base + 0xffff) >> 16;
+  const uint64_t Last = (Base + Size) >> 16;
+  for (uint64_t Page = First; Page < Last; ++Page) {
+    auto& Entry = Cache[Page & kCacheMask];
+    const uint64_t Tag = __atomic_load_n(&Entry.Tag, __ATOMIC_ACQUIRE);
+    if (!(Tag & 1) && (Tag >> 16) == Page && __atomic_load_n(&Entry.Delta, __ATOMIC_RELAXED) == Delta) {
+      CachePublishEntry(Entry, 0, 0);
+    }
+  }
+}
+
+void CacheAdd(IosAliasCacheEntry* Cache, uint64_t Base, uint64_t Size, uint64_t Delta) {
+  if (!Size) return;
+  const uint64_t First = (Base + 0xffff) >> 16;
+  const uint64_t Last = (Base + Size) >> 16;
+  for (uint64_t Page = First; Page < Last; ++Page) {
+    CachePublish(Cache, Page, Delta);
+  }
+}
+
+void EntryPublish(IosAliasEntry& Entry, uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
+  const uint64_t Old = __atomic_load_n(&Entry.Generation, __ATOMIC_RELAXED);
+  __atomic_store_n(&Entry.Generation, Old | 1, __ATOMIC_RELEASE);
+  Entry.PeBase = PeBase;
+  Entry.JitBase = JitBase;
+  Entry.Size = Size;
+  __atomic_store_n(&Entry.Generation, (Old + 2) & ~1ull, __ATOMIC_RELEASE);
+}
+
+bool EntryRead(const IosAliasEntry& Entry, uint64_t& PeBase, uint64_t& JitBase, uint64_t& Size) {
+  const uint64_t Before = __atomic_load_n(&Entry.Generation, __ATOMIC_ACQUIRE);
+  if (Before & 1) return false;
+  PeBase = Entry.PeBase;
+  JitBase = Entry.JitBase;
+  Size = Entry.Size;
+  return Before == __atomic_load_n(&Entry.Generation, __ATOMIC_ACQUIRE);
+}
+
+bool CacheRead(IosAliasCacheEntry* Cache, uint64_t Addr, uint64_t& Result) {
+  const uint64_t Page = Addr >> 16;
+  auto& Entry = Cache[Page & kCacheMask];
+  const uint64_t Before = __atomic_load_n(&Entry.Tag, __ATOMIC_ACQUIRE);
+  if ((Before & 1) || (Before >> 16) != Page) return false;
+  const uint64_t Delta = __atomic_load_n(&Entry.Delta, __ATOMIC_RELAXED);
+  if (Before != __atomic_load_n(&Entry.Tag, __ATOMIC_ACQUIRE)) return false;
+  Result = Addr + Delta;
+  return true;
+}
+
+void UpdateAliasStats(int Count) {
+  uint64_t Live = 0;
+  for (int i = 0; i < Count; ++i) Live += g_Entries[i].Size != 0;
+  IosXpFex[4496] = Live;
+  IosXpFex[4497] = Count;
+}
 }  // namespace
 
 extern "C" {
@@ -373,8 +467,13 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
     return;
   }
 
-  int count = g_EntryCount;
+  UpdateLock Lock;
+  int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
 
+  /* No logging here: this is also called from native Madeira code (ios_push_subfloor_window,
+   * the alias catch-up loop) on threads without a Windows TEB, where FEX's log output reaches
+   * Win32 file APIs with no TEB -- the "alias table capacity" line from the 2048-entry port
+   * crashed every 64-bit Dock launch in NtCreateFile (ObjectName = 3). */
   // Identical re-registration: nothing to do.
   for (int i = 0; i < count; i++) {
     if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
@@ -391,18 +490,19 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
       continue;
     }
     if (pb < PeBase + Size && PeBase < pb + sz) {
-      g_Entries[i].Size = 0;
-      __sync_synchronize();
+      CacheRemove(IosAliasPeCache, pb, sz, g_Entries[i].JitBase - pb);
+      CacheRemove(IosAliasJitCache, g_Entries[i].JitBase, sz, pb - g_Entries[i].JitBase);
+      EntryPublish(g_Entries[i], pb, g_Entries[i].JitBase, 0);
     }
   }
 
   // Prefer a retired slot so long-running processes don't exhaust the table.
   for (int i = 0; i < count; i++) {
     if (!g_Entries[i].Size) {
-      g_Entries[i].PeBase = PeBase;
-      g_Entries[i].JitBase = JitBase;
-      __sync_synchronize();
-      g_Entries[i].Size = Size; // published last: readers see a complete entry
+      EntryPublish(g_Entries[i], PeBase, JitBase, Size);
+      CacheAdd(IosAliasPeCache, PeBase, Size, JitBase - PeBase);
+      CacheAdd(IosAliasJitCache, JitBase, Size, PeBase - JitBase);
+      UpdateAliasStats(count);
       return;
     }
   }
@@ -417,32 +517,36 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
     }
     return;
   }
-  g_Entries[count].PeBase = PeBase;
-  g_Entries[count].JitBase = JitBase;
-  g_Entries[count].Size = Size;
-  __sync_synchronize();
-  g_EntryCount = count + 1;
+  EntryPublish(g_Entries[count], PeBase, JitBase, Size);
+  CacheAdd(IosAliasPeCache, PeBase, Size, JitBase - PeBase);
+  CacheAdd(IosAliasJitCache, JitBase, Size, PeBase - JitBase);
+  __atomic_store_n(&g_EntryCount, count + 1, __ATOMIC_RELEASE);
+  UpdateAliasStats(count + 1);
 }
 
 uint64_t IosJitTranslate(uint64_t Addr) {
-  int count = g_EntryCount;
-  for (int i = 0; i < count; i++) {
-    uint64_t pb = g_Entries[i].PeBase;
-    uint64_t sz = g_Entries[i].Size;
+  uint64_t Result;
+  if (CacheRead(IosAliasPeCache, Addr, Result)) return Result;
+  const int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
+  for (int i = count - 1; i >= 0; --i) {
+    uint64_t pb, jb, sz;
+    if (!EntryRead(g_Entries[i], pb, jb, sz)) continue;
     if (Addr >= pb && Addr < pb + sz) {
-      return g_Entries[i].JitBase + (Addr - pb);
+      return jb + (Addr - pb);
     }
   }
   return Addr;
 }
 
 uint64_t IosJitReverseTranslate(uint64_t Addr) {
-  int count = g_EntryCount;
-  for (int i = 0; i < count; i++) {
-    uint64_t jb = g_Entries[i].JitBase;
-    uint64_t sz = g_Entries[i].Size;
+  uint64_t Result;
+  if (CacheRead(IosAliasJitCache, Addr, Result)) return Result;
+  const int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
+  for (int i = count - 1; i >= 0; --i) {
+    uint64_t pb, jb, sz;
+    if (!EntryRead(g_Entries[i], pb, jb, sz)) continue;
     if (Addr >= jb && Addr < jb + sz) {
-      return g_Entries[i].PeBase + (Addr - jb);
+      return pb + (Addr - jb);
     }
   }
   return Addr;

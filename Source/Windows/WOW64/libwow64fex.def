@@ -19,6 +19,7 @@ EXPORTS
   BTCpuSetContext
   BTCpuSimulate
   BTCpuSuspendLocalThread
+  BTCpuResumeLocalThread
   BTCpuThreadInit
   BTCpuProcessTerm
   BTCpuThreadTerm

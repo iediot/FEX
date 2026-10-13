@@ -20,6 +20,7 @@ $end_info$
 #include <atomic>
 #include <mutex>
 #endif
+#include "Interface/Core/MadeiraCodeCache.h"
 
 namespace FEXCore::CPU {
 union Relocation;
@@ -193,6 +194,23 @@ namespace CPU {
      * @brief Clear any relocations after JIT compiling
      */
     virtual void ClearRelocations() {}
+
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+    /* iOS-Madeira ml2400: install a block from the persistent code cache
+     * (MadeiraCodeCache.h) through the same publish path a compile takes.
+     * Code is the pristine block image; the 8-byte ExitFunctionLinker literals
+     * at LinkerLiteralOffsets are rewritten for this process. Entries are
+     * (guest RIP, offset from the block start). Returns an empty CompiledCode
+     * (BlockBegin == nullptr) when the block cannot be placed. */
+    [[nodiscard]]
+    virtual CompiledCode InstallCachedCode(uint64_t Entry, const uint8_t* Code, uint32_t Size, const fextl::vector<uint64_t>& LinkerLiteralOffsets,
+                                           const fextl::vector<std::pair<uint64_t, uint32_t>>& Entries, FEXCore::Core::DebugData* DebugData) {
+      return {};
+    }
+
+    // Per-thread capture of the block being compiled; see MadeiraCodeCache.h.
+    MadeiraCache::BlockCapture MadeiraCapture;
+#endif
 
     bool IsAddressInCodeBuffer(uintptr_t Address) const;
 

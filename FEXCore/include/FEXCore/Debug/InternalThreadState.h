@@ -87,7 +87,11 @@ struct UnalignedExclusiveStore {
   uint8_t Size;
 };
 
+#ifdef FEX_IOS_HOST
+struct alignas(8192) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
+#else
 struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCore::Allocator::FEXAllocOperators {
+#endif
   FEXCore::Core::CpuStateFrame* const CurrentFrame = &BaseFrameState;
 
   FEXCore::Context::Context* const CTX;
@@ -159,9 +163,24 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   FEXCore::Core::CpuStateFrame BaseFrameState {};
 
   // Can be reprotected as RO to trigger an interrupt at generated code block entrypoints
+#ifdef FEX_IOS_HOST
+  // iOS combines permissions over 16 KB. A 4 KB subpage next to writable
+  // state cannot fault reliably; never protect neighbouring allocator data.
+  // PE/COFF caps alignas at 8 KB, so the page is 8 KB aligned here, its offset
+  // is asserted to be a multiple of 16 KB below, and Core.cpp allocates the
+  // state 16 KB aligned (IosInterruptPageAlign).
+  uint8_t IosInterruptPagePad[8192];   // puts the page on a 16 KB offset
+  alignas(8192) uint8_t InterruptFaultPage[16384];
+#else
   alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
+#endif
 };
 static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
+#ifdef FEX_IOS_HOST
+inline constexpr size_t IosInterruptPageAlign = 16384;
+static_assert(offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) % IosInterruptPageAlign == 0,
+              "the interrupt page must start a 16 KB host page");
+#endif
 // Apple's libc++ has a larger std::shared_mutex (~200 bytes vs ~56 on Linux),
 // which pushes InternalThreadState past the offsets/sizes these asserts check.
 // They remain valid on Linux/Windows.

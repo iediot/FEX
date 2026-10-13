@@ -20,6 +20,7 @@ $end_info$
 #include "Interface/Core/Frontend.h"
 #include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/JIT/JITClass.h"
+#include "Interface/Core/MadeiraCodeCacheHooks.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include <Interface/GDBJIT/GDBJIT.h>
@@ -120,6 +121,160 @@ static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
 /* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
 static volatile uint64_t g_cb_real_compiles = 0;
+
+#ifdef FEX_IOS_HOST
+/* ml2110: [lookup-stats] -- what the dispatcher's L1 misses cost, per thread.
+ *
+ * The generated code probes only the L1 cache (L2 is off on iOS, ml606); every
+ * miss enters CompileBlock in C++, which takes two locks and searches the shared
+ * map. [CB_SUMMARY] showed ~26.7M such entries in one Stickman run with 98% of
+ * them finding an existing block, i.e. L1 misses, not compiles. This measures,
+ * for each guest thread, how many entries there are, how long they take, what
+ * share of the thread's wall time that is, and why L1 missed:
+ *   conflict -- the slot holds another block (direct-mapped collision)
+ *   empty    -- the slot is empty or invalidated
+ *   had-it   -- the slot already holds this block: the generated probe should
+ *               have hit, so it read a different pointer/mask, or the block was
+ *               published between the probe and this call
+ *   ptr-diff -- the frame's L1 pointer differs from the LookupCache's own
+ * plus a few conflicting (rip, evictor) pairs, to see whether the collisions
+ * are module alignment (equal low bits in different images).
+ *
+ * Off unless MADEIRA_FEX_LOOKUP_STATS=1; with it off CompileBlock pays one
+ * load and branch. Slots are claimed per FEXCore thread and written only by
+ * their owner, so the counters are plain stores; no TLS (x18 is not the TEB
+ * on this host). */
+namespace {
+struct IosLookupSlot {
+  std::atomic<uintptr_t> Owner {0};
+  uint64_t Calls, Hits, Compiles, HitTicks, CompileTicks;
+  uint64_t Conflict, Empty, HadIt, PtrDiff;
+  uint64_t WindowStart, Reports;
+  uint64_t Sample[4][2];
+  uint32_t NSamples;
+};
+IosLookupSlot g_IosLookup[128];
+int g_IosLookupOn = -1;
+
+inline uint64_t IosTicks() {
+  uint64_t V;
+  __asm volatile("isb; mrs %0, cntvct_el0" : "=r"(V));
+  return V;
+}
+inline uint64_t IosTickFreq() {
+  uint64_t V;
+  __asm volatile("mrs %0, cntfrq_el0" : "=r"(V));
+  return V ? V : 24000000;
+}
+
+IosLookupSlot* IosLookupSlotFor(const void* Thread) {
+  const uintptr_t Key = reinterpret_cast<uintptr_t>(Thread);
+  size_t H = (Key >> 6) % 128;
+  for (size_t i = 0; i < 128; ++i, H = (H + 1) % 128) {
+    uintptr_t Cur = g_IosLookup[H].Owner.load(std::memory_order_relaxed);
+    if (Cur == Key) {
+      return &g_IosLookup[H];
+    }
+    if (Cur == 0 && g_IosLookup[H].Owner.compare_exchange_strong(Cur, Key, std::memory_order_relaxed)) {
+      return &g_IosLookup[H];
+    }
+  }
+  return nullptr; // more than 128 live FEX threads: stop counting the extra ones
+}
+
+void IosLookupReport(IosLookupSlot* S, uint64_t Now) {
+  const double Freq = double(IosTickFreq());
+  const double WallS = double(Now - S->WindowStart) / Freq;
+  const double SlowS = double(S->HitTicks + S->CompileTicks) / Freq;
+  LogMan::Msg::EFmt("[lookup-stats] ml2110 thr={:#x} #{} {:.1f}s: entries={} ({:.0f}/s) slow-path={:.1f}% of wall | "
+                    "found={} avg={:.2f}us | compiled={} avg={:.1f}us | l1 miss: conflict={} empty={} had-it={} ptr-diff={}",
+                    S->Owner.load(std::memory_order_relaxed), S->Reports, WallS, S->Calls, double(S->Calls) / WallS,
+                    100.0 * SlowS / WallS, S->Hits, S->Hits ? 1e6 * double(S->HitTicks) / Freq / double(S->Hits) : 0.0,
+                    S->Compiles, S->Compiles ? 1e6 * double(S->CompileTicks) / Freq / double(S->Compiles) : 0.0,
+                    S->Conflict, S->Empty, S->HadIt, S->PtrDiff);
+  for (uint32_t i = 0; i < S->NSamples; ++i) {
+    LogMan::Msg::EFmt("[lookup-stats]   conflict rip={:#x} evicted-by={:#x} xor={:#x}", S->Sample[i][0], S->Sample[i][1],
+                      S->Sample[i][0] ^ S->Sample[i][1]);
+  }
+  S->Calls = S->Hits = S->Compiles = S->HitTicks = S->CompileTicks = 0;
+  S->Conflict = S->Empty = S->HadIt = S->PtrDiff = 0;
+  S->NSamples = 0;
+  S->WindowStart = Now;
+  S->Reports++;
+}
+
+class IosLookupGuard {
+public:
+  IosLookupGuard(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
+    if (g_IosLookupOn < 0) {
+      const char* E = getenv("MADEIRA_FEX_LOOKUP_STATS");
+      g_IosLookupOn = (E && E[0] == '1') ? 1 : 0;
+      if (g_IosLookupOn) {
+        LogMan::Msg::EFmt("[lookup-stats] ml2110 on: a report per FEX thread every 5 s (tick {} Hz)", IosTickFreq());
+      }
+    }
+    if (!g_IosLookupOn || !Frame || !Thread) {
+      return;
+    }
+    S = IosLookupSlotFor(Thread);
+    if (!S) {
+      return;
+    }
+    T0 = IosTicks();
+    if (!S->WindowStart) {
+      S->WindowStart = T0;
+    }
+    S->Calls++;
+    // Read the L1 slot exactly as the dispatcher does: L1Pointer + ((L1Index(RIP) << 4) & pre-scaled L1Mask).
+    const uint64_t L1P = Frame->State.L1Pointer;
+    const uint64_t L1M = Frame->State.L1Mask;
+    if (Thread->LookupCache && Thread->LookupCache->GetL1Pointer() != L1P) {
+      S->PtrDiff++;
+    }
+    if (L1P) {
+      const auto* E = reinterpret_cast<const uintptr_t*>(L1P + ((FEXCore::LookupCache::L1Index(GuestRIP) << 4) & L1M));
+      const uintptr_t Host = E[0], Guest = E[1];
+      if (Guest == GuestRIP && Host) {
+        S->HadIt++;
+      } else if (Guest == 0) {
+        S->Empty++;
+      } else {
+        S->Conflict++;
+        if (S->NSamples < 4 && (S->Conflict & 0xfff) == 1) {
+          S->Sample[S->NSamples][0] = GuestRIP;
+          S->Sample[S->NSamples][1] = Guest;
+          S->NSamples++;
+        }
+      }
+    }
+  }
+  ~IosLookupGuard() {
+    if (!S) {
+      return;
+    }
+    const uint64_t Now = IosTicks();
+    if (Compiled) {
+      S->Compiles++;
+      S->CompileTicks += Now - T0;
+    } else {
+      S->Hits++;
+      S->HitTicks += Now - T0;
+    }
+    if ((S->Calls & 0x3ff) == 0 && Now - S->WindowStart >= 5 * IosTickFreq()) {
+      IosLookupReport(S, Now);
+    }
+  }
+  void MarkCompiled() {
+    Compiled = true;
+  }
+
+private:
+  IosLookupSlot* S {};
+  uint64_t T0 {};
+  bool Compiled {};
+};
+} // namespace
+#endif
 
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
 /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
@@ -547,8 +702,13 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
    * The band is finite and a title with enough threads exhausts it, so this is
    * an ordinary outcome, not a theoretical one. Placement-new after an explicit
    * check makes the failure returnable. */
+#ifdef FEX_IOS_HOST
+  void* ThreadMem = FEXCore::Allocator::aligned_alloc(FEXCore::Core::IosInterruptPageAlign,
+                                                      sizeof(FEXCore::Core::InternalThreadState));
+#else
   void* ThreadMem = FEXCore::Allocator::aligned_alloc(alignof(FEXCore::Core::InternalThreadState),
                                                       sizeof(FEXCore::Core::InternalThreadState));
+#endif
 #ifdef FEX_IOS_HOST
   /* MADEIRA_FEX_FAIL_CALLRET=threadstate:N fails the Nth thread-state
    * allocation, so this containment path can be proven rather than assumed --
@@ -1439,6 +1599,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
+#ifdef FEX_IOS_HOST
+  IosLookupGuard IosLookupTimer(Frame, Thread, GuestRIP);   // ml2110 [lookup-stats]
+#endif
 
 #ifdef FEX_IOS_HOST
   /* ml648: consume any pending Mono-backpatcher event.
@@ -1461,6 +1624,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * log will say so outright. */
   if (MonoBackpatcherBridgeArmed()) {
     IosMonoTryActivate(this, Thread);
+  }
+#endif
+
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  /* iOS-Madeira ml2400: the persistent code cache's file work (a module's index
+   * on first use, periodic writes) runs here, before this call takes any FEX
+   * lock, and never from an ml455 delivery compile. Off: one relaxed load. */
+  if (MadeiraCache::Enabled(this) && !FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf()) {
+    MadeiraCache::SafePoint(this, Thread);
   }
 #endif
 
@@ -2154,6 +2326,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // iOS-Madeira: cache miss reached — count as true compile.
   __sync_add_and_fetch(&g_cb_real_compiles, 1);
+#ifdef FEX_IOS_HOST
+  IosLookupTimer.MarkCompiled();
+#endif
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
@@ -2165,7 +2340,40 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     FEXCore::Utils::WritePriorityMutex::IosAdjustUnpublishedCompileDepth(1);
   }
 #endif
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  /* iOS-Madeira ml2400: persistent code cache. A validated cached block is
+   * installed instead of compiling; otherwise the compile is captured for the
+   * file. Neither for delivery compiles, MaxInst overrides or TF single-step
+   * blocks (those differ from the block the same RIP normally gets). */
+  CompileCodeResult IosCompiled {};
+  MadeiraCache::InstalledBlock IosCached;
+  bool IosFromCache = false;
+  const bool IosCacheEligible = MadeiraCache::Enabled(this) && !IosUnpublished && MaxInst == 0 &&
+                                !Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+  const bool IosMonoBlock = IosCacheEligible && AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP;
+  if (IosCacheEligible) {
+    IosFromCache = MadeiraCache::TryInstall(this, Thread, GuestRIP, IosMonoBlock, IosCompiled.CompiledCode, IosCompiled.DebugData, IosCached);
+  }
+  if (IosFromCache) {
+    IosCompiled.StartAddr = IosCached.StartAddr;
+    IosCompiled.Length = IosCached.Length;
+    IosCompiled.NeedsAddGuestCodeRanges = true;
+  } else {
+    if (IosCacheEligible) {
+      MadeiraCache::ArmCapture(Thread, true);
+    }
+    IosCompiled = CompileCode(Thread, GuestRIP, MaxInst);
+    if (IosCacheEligible) {
+      if (IosCompiled.DebugData) {
+        MadeiraCache::SealCapture(this, Thread, GuestRIP, IosCompiled.CompiledCode);
+      }
+      Thread->CPUBackend->MadeiraCapture.Active = false;
+    }
+  }
+  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = std::move(IosCompiled);
+#else
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+#endif
 #ifdef FEX_IOS_HOST
   if (IosUnpublished) {
     FEXCore::Utils::WritePriorityMutex::IosAdjustUnpublishedCompileDepth(-1);
@@ -2251,6 +2459,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   fextl::vector<uint64_t> CodePages;
 
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  if (NeedsAddGuestCodeRanges && IosFromCache) {
+    // ml2400: the decoder did not run; the record carries the same page and entry sets.
+    CodePages = IosCached.CodePages;
+    for (auto CodePage : IosCached.CodePages) {
+      if (Thread->LookupCache->AddBlockExecutableRange(Thread, IosCached.GuestEntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
+        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+      }
+    }
+  } else
+#endif
   if (NeedsAddGuestCodeRanges) {
     // Track in the guest to host map all entrypoints for all pages the compiled block touches, if any page didn't previously
     // contain code, inform the frontend so it can setup SMC detection.
@@ -2269,6 +2488,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
   }
+
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  // ml2400: published and its pages write-protected; queue it for the cache file.
+  if (IosCacheEligible && !IosFromCache && NeedsAddGuestCodeRanges) {
+    MadeiraCache::Record(this, Thread, GuestRIP, CompiledCode, IosMonoBlock);
+  }
+#endif
 
   if (CodeMapWriter) {
     auto Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
@@ -2441,6 +2667,27 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
+  if (CTX->GetGuestBase()) {
+    /* MADEIRA ml2108: under a guest window (the WoW64 module) store WITHOUT the invalidation lock.
+     *
+     * The patched page is usually SMC write-trapped. Its fault goes through the Windows exception
+     * path to InvalidationTracker::HandleRWXAccessViolation, which takes CodeInvalidationMutex to
+     * invalidate and untrap. Holding that mutex here made the fault wait on this very thread: a
+     * 32-bit Unity Mono title's main thread self-deadlocked on its 14th SMC fault (the other 13,
+     * from translated code, were untrapped normally) and the game never left its loading screen.
+     * Unlocked, the store faults, is untrapped and retried like any guest write; the range is
+     * invalidated below as before. */
+    const uint64_t Dest = Address + CTX->GetGuestBase();
+    if (Size == 8) {
+      *reinterpret_cast<uint64_t*>(Dest) = Value;
+    } else if (Size == 4) {
+      *reinterpret_cast<uint32_t*>(Dest) = Value;
+    } else {
+      ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
+    }
+    CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, Address, Size);
+    return;
+  }
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
@@ -2463,6 +2710,15 @@ void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint
       Dest = RW;
     }
     ios_fex_mono_count_helper(RW ? 0 : 1);
+
+    /* No alias: the target is plain memory, e.g. an executable NT heap that the host keeps
+     * read-write (virtual_ios.c VPROT_HEAP). Its pages may be write-trapped for SMC detection,
+     * and a direct store would fault into HandleRWXAccessViolation, which takes
+     * CodeInvalidationMutex -- already held here, so the thread would wait on itself forever.
+     * Let the frontend untrap, store and retrap under the lock we hold instead. */
+    if (!RW && CTX->SyscallHandler->WriteUntrackedLocked(Thread, Dest, Size, Value)) {
+      // stored; fall through to the invalidation below
+    } else
 #endif
 
     if (Size == 8) {

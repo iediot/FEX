@@ -1223,6 +1223,15 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     SetCursorOffset(PrevCur);
   }
 
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  // iOS-Madeira ml2400: keep the pristine image for the persistent code cache (only when armed).
+  MadeiraCaptureBlock(TempCodeBuffer, GetCursorOffset(), PrevNumAllocations);
+#endif
+
+  return PublishTempCode(TempCodeBuffer, CodeBegin, CodeOnlySize, PrevNumAllocations);
+}
+
+CPUBackend::CompiledCode Arm64JITCore::PublishTempCode(uint8_t* TempCodeBuffer, uint8_t* CodeBegin, uint64_t CodeOnlySize, size_t PrevNumAllocations) {
   // Migrate the compile output from temporary storage to the actual CodeBuffer.
   // This can block progress in other compiling threads, so the duration of the lock should be as small as possible.
   {
@@ -1425,7 +1434,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 #endif
 
 #ifdef VIXL_DISASSEMBLER
-  if (Disassemble() & FEXCore::Config::Disassemble::STATS) {
+  if (IR && (Disassemble() & FEXCore::Config::Disassemble::STATS)) {
     auto HeaderOp = IR->GetHeader();
     LOGMAN_THROW_A_FMT(HeaderOp->Header.Op == IR::OP_IRHEADER, "First op wasn't IRHeader");
 
@@ -1455,6 +1464,88 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
   return std::move(CodeData);
 }
+
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+/* iOS-Madeira ml2400: capture the finished block for the persistent code cache.
+ * Taken from the temp buffer, i.e. before publication: the published copy gets
+ * linked (its exit stubs patched) as soon as it runs, this one never is. Offsets
+ * of this compile's relocations are still temp-buffer (= block) relative here;
+ * PublishTempCode rebases them onto the code buffer afterwards. Skipped for an
+ * ml455 delivery compile: it can interrupt an armed compile on this thread and
+ * must not overwrite that compile's capture. */
+void Arm64JITCore::MadeiraCaptureBlock(const uint8_t* TempCodeBuffer, size_t Size, size_t PrevNumAllocations) {
+  auto& C = MadeiraCapture;
+  if (!C.Active || FEXCore::Utils::WritePriorityMutex::IosUnpublishedCompileActive()) {
+    return;
+  }
+  C.Entry = Entry;
+  C.Code.assign(TempCodeBuffer, TempCodeBuffer + Size);
+  C.Relocs.clear();
+  for (size_t Idx = PrevNumAllocations; Idx != Relocations.size(); ++Idx) {
+    const auto& R = Relocations[Idx];
+    const uint32_t Offset = static_cast<uint32_t>(R.Header.Offset);
+    switch (R.Header.Type) {
+    case RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+      C.Relocs.push_back({Offset, uint32_t(MadeiraCache::RelocKind::ExitLinkerLiteral), uint64_t(R.NamedSymbolLiteral.Symbol)});
+      break;
+    case RelocationTypes::RELOC_GUEST_RIP_LITERAL:
+      C.Relocs.push_back({Offset, uint32_t(MadeiraCache::RelocKind::GuestRIPLiteral), R.GuestRIP.GuestRIP});
+      break;
+    case RelocationTypes::RELOC_GUEST_RIP_MOVE:
+      C.Relocs.push_back({Offset, uint32_t(MadeiraCache::RelocKind::GuestRIPMove), R.GuestRIP.GuestRIP});
+      break;
+    default:
+      // Thunk moves (host library pointers) and anything new: not reproducible in another process.
+      C.Uncacheable = true;
+      break;
+    }
+  }
+  C.Valid = true;
+}
+
+/* iOS-Madeira ml2400: place a cached block. It is copied into a temp buffer,
+ * its ExitFunctionLinker literals rewritten for this process (the dispatcher
+ * lives at a different pool address every run), and then handed to the very
+ * publish tail a fresh compile uses, so code buffer rollover, ResetCallRetStack,
+ * the RW-alias copy and the kernel icache flush are identical for both. */
+CPUBackend::CompiledCode Arm64JITCore::InstallCachedCode(uint64_t Entry, const uint8_t* Code, uint32_t Size,
+                                                         const fextl::vector<uint64_t>& LinkerLiteralOffsets,
+                                                         const fextl::vector<std::pair<uint64_t, uint32_t>>& Entries,
+                                                         FEXCore::Core::DebugData* DebugData) {
+  FEXCORE_PROFILE_SCOPED("Arm64::InstallCachedCode");
+  this->Entry = Entry;
+  this->DebugData = DebugData;
+  this->IR = nullptr;
+
+  const uint32_t DesiredBufferRange = AlignUp(FEXCore::Utils::FEX_PAGE_SIZE * 2 + Size, FEXCore::Utils::FEX_PAGE_SIZE);
+  auto TempCodeBufferInfo = TempAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
+  auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
+  if (!TempCodeBuffer || TempCodeBufferInfo.Size < FEXCore::Utils::FEX_PAGE_SIZE + Size) {
+    TempAllocator.DelayedDisownBuffer();
+    return {};
+  }
+  SetBuffer(TempCodeBuffer, TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE);
+#if defined(__APPLE__) || defined(FEX_IOS_HOST)
+  SetWriteOffset(0); // heap temp buffer, as in CompileCode
+#endif
+
+  memcpy(TempCodeBuffer, Code, Size);
+  const uint64_t Linker = GetNamedSymbolLiteral(*CTX, RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER);
+  for (uint64_t Offset : LinkerLiteralOffsets) {
+    memcpy(TempCodeBuffer + Offset, &Linker, sizeof(Linker));
+  }
+
+  CodeData.BlockBegin = TempCodeBuffer;
+  CodeData.EntryPoints.clear();
+  for (const auto& [Guest, HostOffset] : Entries) {
+    CodeData.EntryPoints.emplace(Guest, TempCodeBuffer + HostOffset);
+  }
+  CodeData.Size = Size;
+  SetCursorOffset(Size);
+
+  return PublishTempCode(TempCodeBuffer, TempCodeBuffer + sizeof(JITCodeHeader), Size - sizeof(JITCodeHeader), Relocations.size());
+}
+#endif
 
 void Arm64JITCore::ResetStack() {
   if (SpillSlots == 0) {

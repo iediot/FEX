@@ -357,6 +357,11 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
+#ifdef FEX_IOS_HOST
+// Serialize count changes and keep state alive through a cooperative park.
+// Never hold ThreadCreationMutex while waiting for JIT exit (compilation uses it).
+std::mutex WowSuspendMutex;
+#endif
 std::mutex ThreadCreationMutex;
 // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
 std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
@@ -765,11 +770,14 @@ void FlushCpuAreaForExit(TLS TLS) {
 void LockJITContext(TLS TLS) {
   uint32_t Expected = TLS.ControlWord().load(), New;
 
-  // Spin until PAUSED is unset, setting IN_JIT when that occurs
+  // Wait until PAUSED is unset, setting IN_JIT atomically with that check
   do {
+    if (Expected & ControlBits::PAUSED) {
+      __asm__ volatile("yield" ::: "memory");
+    }
     Expected = Expected & ~ControlBits::PAUSED;
     New = (Expected | ControlBits::IN_JIT) & ~ControlBits::WOW_CPU_AREA_DIRTY;
-  } while (!TLS.ControlWord().compare_exchange_weak(Expected, New, std::memory_order::relaxed));
+  } while (!TLS.ControlWord().compare_exchange_weak(Expected, New, std::memory_order::acquire));
   std::atomic_signal_fence(std::memory_order::seq_cst);
 
 #ifdef FEX_IOS_HOST
@@ -789,7 +797,7 @@ void LockJITContext(TLS TLS) {
 
 void UnlockJITContext(TLS TLS) {
   std::atomic_signal_fence(std::memory_order::seq_cst);
-  TLS.ControlWord().fetch_and(~ControlBits::IN_JIT, std::memory_order::relaxed);
+  TLS.ControlWord().fetch_and(~ControlBits::IN_JIT, std::memory_order::release);
 }
 
 class ScopedJITContextLock {
@@ -813,14 +821,17 @@ bool HandleSuspendInterrupt(TLS TLS, CONTEXT* Context, uint64_t FaultAddress) {
   }
 
   void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
-  SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
+  SIZE_T TmpSize = sizeof(TLS.ThreadState()->InterruptFaultPage);
   ULONG TmpProt;
   NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READWRITE, &TmpProt);
 
   // Since interrupts only happen at the start of blocks, the reconstructed state should be entirely accurate
   ReconstructThreadState(TLS, Context);
 
-  // Yield to the suspender
+#ifdef FEX_IOS_HOST
+  FlushCpuAreaForExit(TLS);
+#endif
+  // Publish the reconstructed guest registers before acknowledging the park.
   UnlockJITContext(TLS);
   LockJITContext(TLS);
 
@@ -1434,7 +1445,16 @@ void BTCpuProcessInit() {
   }
 }
 
-void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {}
+/* iOS-Madeira ml2400: see ARM64EC ProcessTerm -- write the persistent code
+ * cache's pending blocks before the process goes away. */
+extern "C" void MadeiraFexCodeCacheProcessTerm();
+void BTCpuProcessTerm(HANDLE Handle, BOOL After, ULONG Status) {
+#ifdef FEX_IOS_HOST
+  if (!After) {
+    MadeiraFexCodeCacheProcessTerm();
+  }
+#endif
+}
 
 void BTCpuThreadInit() {
   static constexpr size_t DefaultWow64CS {4};
@@ -1495,6 +1515,9 @@ void BTCpuThreadInit() {
 }
 
 void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
+#ifdef FEX_IOS_HOST
+  std::scoped_lock SuspendLock(WowSuspendMutex);
+#endif
   if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_TERMINATE)) {
     return;
   }
@@ -1509,6 +1532,10 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
   const auto ThreadTID = reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread);
   bool Self = ThreadTID == GetCurrentThreadId();
   if (!Self) {
+#ifdef FEX_IOS_HOST
+    auto [Status, TargetTLS] = GetThreadTLS(*ThreadDup);
+    if (!Status && TargetTLS.TEB) TargetTLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
+#endif
     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
     RtlWow64SuspendThread(*ThreadDup, NULL);
 #ifdef FEX_IOS_HOST
@@ -1716,7 +1743,97 @@ extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
   CTX->ExecuteThread(TLS.ThreadState());
 }
 
+#ifdef FEX_IOS_HOST
+static void WowParkLog(const char* Action, uint64_t Tid, ULONG Previous, uint64_t WaitUs, NTSTATUS Status) {
+  static std::atomic<uint32_t> Serial {};
+  auto N = ++Serial;
+  if (N <= 32 || !(N % 128)) {
+    IosRawReport("[wow-park] #{} {} tid={:x} previous={} wait_us={} status={:x} source={}",
+                 N, Action, Tid, Previous, WaitUs, static_cast<uint32_t>(Status),
+                 Status ? "unavailable" : "parked-cpu-area");
+  }
+}
+
+static NTSTATUS IosSuspendLocalThread(HANDLE Thread, ULONG* Count) {
+  if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) return STATUS_ACCESS_DENIED;
+  auto Dup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
+  THREAD_BASIC_INFORMATION Info;
+  auto Status = NtQueryInformationThread(*Dup, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
+  if (Status) return Status;
+  auto Tid = reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread);
+  if (Tid == GetCurrentThreadId()) return NtSuspendThread(*Dup, Count);
+
+  std::scoped_lock SuspendLock(WowSuspendMutex);
+  auto [Err, Target] = GetThreadTLS(*Dup);
+  if (Err) return Err;
+  {
+    // A thread created suspended has no TEB address yet on this host
+    // (GetThreadTLS succeeds with null) and never entered the JIT.
+    std::scoped_lock Lock(ThreadCreationMutex);
+    if (!Target.TEB || !Threads.contains(Tid)) return NtSuspendThread(*Dup, Count);
+  }
+  const auto Start = std::chrono::steady_clock::now();
+  const auto PreviousControl = Target.ControlWord().fetch_or(ControlBits::PAUSED, std::memory_order::acq_rel);
+  if (PreviousControl & ControlBits::IN_JIT) {
+    void* Address = &Target.ThreadState()->InterruptFaultPage;
+    SIZE_T Size = sizeof(Target.ThreadState()->InterruptFaultPage);
+    ULONG OldProtect;
+    Status = NtProtectVirtualMemory(NtCurrentProcess(), &Address, &Size, PAGE_READONLY, &OldProtect);
+  }
+  while (!Status && (Target.ControlWord().load(std::memory_order::acquire) & ControlBits::IN_JIT)) {
+    // A failed interrupt must fail the API, not deadlock a GC or claim success.
+    if (std::chrono::steady_clock::now() - Start > std::chrono::milliseconds(250)) {
+      Status = STATUS_UNSUCCESSFUL;
+      break;
+    }
+    __asm__ volatile("yield" ::: "memory");
+  }
+  ULONG Previous = 0;
+  if (!Status) {
+    // The owning thread flushed the CPU area before its release of IN_JIT.
+    // Do not flush remotely: that would overwrite a pending SetThreadContext.
+    Status = NtSuspendThread(*Dup, &Previous);
+    if (!Status && Count) *Count = Previous;
+  }
+  if (Status && !(PreviousControl & ControlBits::PAUSED))
+    Target.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
+  auto WaitUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - Start).count();
+  WowParkLog("park", Tid, Previous, WaitUs, Status);
+  return Status;
+}
+
+NTSTATUS BTCpuResumeLocalThread(HANDLE Thread, ULONG* Count) {
+  if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) return STATUS_ACCESS_DENIED;
+  auto Dup = FEX::Windows::DupHandle(Thread, THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME);
+  THREAD_BASIC_INFORMATION Info;
+  auto Status = NtQueryInformationThread(*Dup, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
+  if (Status) return Status;
+  std::scoped_lock SuspendLock(WowSuspendMutex);
+  ULONG Previous = 0;
+  Status = NtResumeThread(*Dup, &Previous);
+  if (!Status) {
+    if (Count) *Count = Previous;
+    // Native resume applies queued context writes before returning. Nested
+    // suspends, including those from different callers, retain PAUSED.
+    if (Previous <= 1) {
+      // Only threads this module parked: resuming a thread created suspended
+      // (the usual CreateThread path) found a null TEB and faulted at 0x1508.
+      auto [Err, Target] = GetThreadTLS(*Dup);
+      const auto Tid = static_cast<DWORD>(reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread));
+      std::scoped_lock Lock(ThreadCreationMutex);
+      if (!Err && Target.TEB && Threads.contains(Tid))
+        Target.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::release);
+    }
+  }
+  WowParkLog(Previous > 1 ? "retain" : "unpark", reinterpret_cast<uint64_t>(Info.ClientId.UniqueThread), Previous, 0, Status);
+  return Status;
+}
+#endif
+
 NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
+#ifdef FEX_IOS_HOST
+  return IosSuspendLocalThread(Thread, Count);
+#else
   if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_SUSPEND_RESUME)) {
     return STATUS_ACCESS_DENIED;
   }
@@ -1764,7 +1881,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
 
     ULONG TmpProt;
     void* TmpAddress = &TLS.ThreadState()->InterruptFaultPage;
-    SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    SIZE_T TmpSize = sizeof(TLS.ThreadState()->InterruptFaultPage);
     NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PAGE_READONLY, &TmpProt);
   }
 
@@ -1809,6 +1926,7 @@ NTSTATUS BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count) {
   TLS.ControlWord().fetch_and(~ControlBits::PAUSED, std::memory_order::relaxed);
 
   return Err;
+#endif
 }
 
 // Returns true if exception dispatch should be halted and the execution context restored to Ptrs->Context

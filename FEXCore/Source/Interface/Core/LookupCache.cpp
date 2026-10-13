@@ -152,6 +152,12 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
 }
 
 LookupCache::~LookupCache() {
+#ifdef FEX_IOS_HOST
+  if (BigL1Pointer) {
+    FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(BigL1Pointer), BIG_L1_SIZE);
+    BigL1Grants.fetch_sub(1, std::memory_order_relaxed);
+  }
+#endif
   // ml606: free what was actually mapped. PagePointer/TotalCacheSize only
   // describe the full layout and are wrong (PagePointer is 0) in L1-only mode.
   FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(AllocationBase), AllocationSize);
@@ -185,6 +191,12 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
   // ml606: clear exactly what is mapped. In L1-only mode that is the L1 array
   // alone; using TotalCacheSize here would decommit 48MB we never allocated.
   FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(AllocationBase), AllocationSize, false);
+#ifdef FEX_IOS_HOST
+  // The granted big L1 (LookupCache.h, GrantBigL1) is the live one: zero it too, recommitted.
+  if (BigL1Pointer) {
+    FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(BigL1Pointer), BIG_L1_SIZE, true);
+  }
+#endif
 
   // TODO: Rename this member to avoid confusion with code caching
   CachedCodePages.clear();

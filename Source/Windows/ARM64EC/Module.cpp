@@ -102,9 +102,16 @@ uint64_t IosFfsBypassLog[4] {};
  *   2112  EC->x64 calls through ExitToX64 (not the FFS bypass), 16 shards
  *   3136  ring index (every 64th x64->EC call of a shard appends its target)
  *   3200  ring[4096] of target addresses (as the x64 caller called them)
+ *   35968 live alias entries; 35976 allocated/high-water entry slots
+ *   36096 PE->JIT cache misses/table walks, 16 shards
+ *   37120 JIT->PE cache misses/table walks, 16 shards
  * Keep in sync with Module.S and build/ntdll-unix/server_ios.c (ios_xp_fex_*). */
-extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4496];
-__attribute__((aligned(64))) uint64_t IosXpFex[4496] {};
+extern "C" __attribute__((aligned(64))) uint64_t IosXpFex[4768];
+__attribute__((aligned(64))) uint64_t IosXpFex[4768] {};
+/* iOS-Madeira ml1132: one read+branch at each probe when diagnostics are off.
+ * Keep this separate from IosXpFex so the profiler's exported layout stays stable. */
+extern "C" uint64_t IosXpEnabled;
+uint64_t IosXpEnabled {};
 #endif // FEX_IOS_HOST
 
 namespace Exception {
@@ -756,6 +763,26 @@ public:
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
+  // Called by MonoBackpatcherWrite with CodeInvalidationMutex held exclusively. Untrap (which
+  // also invalidates the range), store, retrap. BeginUntrackedWriteLocked's NtProtectVirtualMemory
+  // notification is skipped while IntervalsLock is held, so nothing here re-enters the mutex.
+  // ThreadCreationMutex is deliberately not taken: it orders before CodeInvalidationMutex.
+  bool WriteUntrackedLocked(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint8_t Size, uint64_t Value) override {
+    if (!InvalidationTracker || (Size != 4 && Size != 8)) {
+      return false;
+    }
+    if (!InvalidationTracker->BeginUntrackedWriteLocked(Address, Size)) {
+      return false;
+    }
+    if (Size == 8) {
+      *reinterpret_cast<volatile uint64_t*>(Address) = Value;
+    } else {
+      *reinterpret_cast<volatile uint32_t*>(Address) = static_cast<uint32_t>(Value);
+    }
+    InvalidationTracker->ReprotectRWXIntervals(Address, Size);
+    return true;
+  }
+
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
     OvercommitTracker->MarkRange(Start, Length);
   }
@@ -892,6 +919,12 @@ NTSTATUS ProcessInit() {
   InitSyscalls();
 
   FEX::Windows::InitCRTProcess();
+#ifdef FEX_IOS_HOST
+  {
+    const char* Xp = getenv("MADEIRA_FEX_XP");
+    IosXpEnabled = Xp && Xp[0] == '1' && Xp[1] == 0;
+  }
+#endif
   const auto ExecutableName = FEX::Windows::BaseName(FEX::Windows::GetExecutableFilePath());
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
@@ -949,8 +982,10 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml908"
+#define MADEIRA_REV "ml1132"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
+  LogMan::Msg::EFmt("[xp-api] MADEIRA_FEX_XP={} ({})", IosXpEnabled ? 1 : 0,
+                    IosXpEnabled ? "transition probes enabled" : "transition probes disabled");
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
    *
@@ -1110,7 +1145,17 @@ NTSTATUS ProcessInit() {
   return STATUS_SUCCESS;
 }
 
-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+/* iOS-Madeira ml2400: process exit (Wine calls this with Handle 0 before
+ * terminating the other threads): write the persistent code cache's pending
+ * blocks. No-op unless MADEIRA_FEX_CODE_CACHE=1. */
+extern "C" void MadeiraFexCodeCacheProcessTerm();
+void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+#ifdef FEX_IOS_HOST
+  if (!After) {
+    MadeiraFexCodeCacheProcessTerm();
+  }
+#endif
+}
 
 class ScopedCallbackDisable {
 private:

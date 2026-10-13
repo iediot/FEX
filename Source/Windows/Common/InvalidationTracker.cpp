@@ -109,6 +109,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
     const bool EagerDEP = DEPDisabled && !GuestBase;
     const bool EffectiveExec = HasExec || (EagerDEP && ProtIsReadable(Prot));
     const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+    if (GuestBase && AlignedBase >= GuestBase && AlignedBase - GuestBase < (1ULL << 32) && (HasExec || XIntervals.Intersect(ProtInterval))) {
+      // MADEIRA ml2107: every executable-relevant protection change in the window.
+      static std::atomic<uint32_t> NotifyLogs {0};
+      if (NotifyLogs.fetch_add(1, std::memory_order_relaxed) < 200) {
+        LogMan::Msg::EFmt("[smc-notify] ml2107 guest {:#x}+{:#x} prot {:#x}: exec={} rwx={}", AlignedBase - GuestBase,
+                          AlignedSize, Prot, EffectiveExec, EffectiveRWX);
+      }
+    }
 
     if (EffectiveExec) {
       XIntervals.Insert(ProtInterval);
@@ -513,6 +521,26 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
     std::shared_lock Lock(IntervalsLock);
     if (!RWXIntervals.Query(Address).Enclosed) {
+#if !defined(ARCHITECTURE_arm64ec)
+      /* MADEIRA ml2107: a write fault in the guest window that is NOT a tracked RWX page. A
+       * 32-bit Unity title kept faulting on writes to a page the host had read-only ("exec-
+       * downgraded page that never got W") and every one went to the guest as an access
+       * violation. Say what this tracker and the memory map know about the page. */
+      if (GuestBase && Address >= GuestBase && Address - GuestBase < (1ULL << 32)) {
+        static std::atomic<uint32_t> MissLogs {0};
+        if (MissLogs.fetch_add(1, std::memory_order_relaxed) < 48) {
+          MEMORY_BASIC_INFORMATION Info {};
+          const bool HaveInfo = VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info));
+          const auto RWX = RWXIntervals.Query(Address);
+          LogMan::Msg::EFmt("[smc-miss] ml2107 guest {:#x} hostpc {:#x}: X={} DEPpromoted={} nextRWX+{:#x} | "
+                            "vq={} base={:#x} size={:#x} prot={:#x} alloc_prot={:#x} state={:#x} type={:#x}",
+                            Address - GuestBase, HostPc, XIntervals.Query(Address).Enclosed,
+                            DEPPromotedIntervals.Query(Address).Enclosed, RWX.Size, HaveInfo,
+                            reinterpret_cast<uint64_t>(Info.BaseAddress) - GuestBase, Info.RegionSize, Info.Protect,
+                            Info.AllocationProtect, Info.State, Info.Type);
+        }
+      }
+#endif
       return {false, 0};
     }
     return {true, GetUntrapProt(Address)};
@@ -529,7 +557,16 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       ULONG TmpProt;
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      const NTSTATUS UntrapStatus = NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+#if !defined(ARCHITECTURE_arm64ec)
+      if (GuestBase && FaultAddress >= GuestBase && FaultAddress - GuestBase < (1ULL << 32)) {
+        static std::atomic<uint32_t> UntrapLogs {0};
+        if (UntrapStatus || UntrapLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
+          LogMan::Msg::EFmt("[smc-untrap] ml2107 guest {:#x} -> prot {:#x}: status {:#x} (was {:#x})",
+                            FaultAddress - GuestBase, UntrapProt, static_cast<uint32_t>(UntrapStatus), TmpProt);
+        }
+      }
+#endif
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
     return true;
@@ -856,7 +893,18 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
       void* TmpAddress = reinterpret_cast<void*>(Address);
       SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
       ULONG TmpProt;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
+      const ULONG NewProt = ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address);
+      const NTSTATUS ProtStatus = NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, NewProt, &TmpProt);
+#if !defined(ARCHITECTURE_arm64ec)
+      if (GuestBase && Address >= GuestBase && Address - GuestBase < (1ULL << 32)) {
+        static std::atomic<uint32_t> TrapLogs {0};
+        if (ProtStatus || TrapLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
+          LogMan::Msg::EFmt("[smc-{}] ml2107 guest {:#x}+{:#x} -> prot {:#x}: status {:#x} (was {:#x})",
+                            ForWriteLocked ? "untrap" : "trap", Address - GuestBase, TmpSize, NewProt,
+                            static_cast<uint32_t>(ProtStatus), TmpProt);
+        }
+      }
+#endif
     } else if (!Query.Size) {
       // No more regions past `Address` in the interval list
       break;

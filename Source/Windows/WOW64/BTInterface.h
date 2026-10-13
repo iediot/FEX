@@ -16,6 +16,7 @@ NTSTATUS STDMETHODCALLTYPE BTCpuGetContext(HANDLE Thread, HANDLE Process, void* 
 NTSTATUS STDMETHODCALLTYPE BTCpuSetContext(HANDLE Thread, HANDLE Process, void* Unknown, WOW64_CONTEXT* Context);
 void STDMETHODCALLTYPE BTCpuSimulate();
 NTSTATUS STDMETHODCALLTYPE BTCpuSuspendLocalThread(HANDLE Thread, ULONG* Count);
+NTSTATUS STDMETHODCALLTYPE BTCpuResumeLocalThread(HANDLE Thread, ULONG* Count);
 NTSTATUS STDMETHODCALLTYPE BTCpuResetToConsistentState(EXCEPTION_POINTERS* Ptrs);
 void STDMETHODCALLTYPE BTCpuFlushInstructionCache2(const void* Address, SIZE_T Size);
 void STDMETHODCALLTYPE BTCpuFlushInstructionCacheHeavy(const void* Address, SIZE_T Size);

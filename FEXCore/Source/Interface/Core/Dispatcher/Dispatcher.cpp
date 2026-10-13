@@ -277,7 +277,16 @@ void Dispatcher::EmitDispatcher() {
     ARMEmitter::ForwardLabel L1Miss;
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
     // Entry address = L1Pointer + ((RIP << ilog2(entry size)) & pre-scaled mask)
+#ifdef FEX_IOS_HOST
+    // MADEIRA ml2111: slot = ((RIP ^ (RIP >> 17)) << 4) & mask = ((RIP << 4) & mask) ^ ((RIP >> 13) & mask),
+    // the scaled mask having its low 4 bits clear. Same function as LookupCache::L1Index.
+    and_(ARMEmitter::Size::i64Bit, TMP4, TMP2, RipReg, ARMEmitter::ShiftType::LSR,
+         LookupCache::L1IndexFoldShift - FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
     and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    eor(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4);
+#else
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+#endif
     add(TMP1, TMP1, TMP2);
     ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
     sub(TMP2, TMP2, RipReg);
@@ -338,10 +347,17 @@ void Dispatcher::EmitDispatcher() {
 
         // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
         // L1Mask is pre-shifted.
+#ifdef FEX_IOS_HOST
+        // MADEIRA ml2111: no L1 refill here. The slot is LookupCache::L1Index, which needs a third
+        // scratch register and TMP3 (RipReg) / TMP4 (the host code) are both live. CompileBlock's
+        // FindBlock refills L1 on the next miss instead; L2 is off on iOS (DisableL2Cache), so this
+        // path is not emitted there in the first place.
+#else
         and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
         add(TMP1, TMP1, TMP2);
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);
+#endif
 
         // Jump to the block
         br(TMP4);

@@ -599,6 +599,15 @@ fextl::string GetHomeDirectory() {
   if (HomeDir) {
     // Skip over the \??\ prefix in the NT path since we want a DOS path
     HomeDir += 4;
+    // MADEIRA: Wine can give \??\unix\... (no drive letter) here; without the prefix
+    // that is a RELATIVE path, so FEX created unix\var\mobile\...\.config\fex-emu inside
+    // every game's folder. Keep such a path absolute with the \\?\ device prefix.
+    // A \\?\ path is not normalised, so its separators must already be backslashes.
+    if (!(HomeDir[0] && HomeDir[1] == ':')) {
+      fextl::string Absolute = fextl::fmt::format("\\\\?\\{}", HomeDir);
+      for (auto& c : Absolute) if (c == '/') c = '\\';
+      return Absolute;
+    }
   };
 
   if (!HomeDir) {

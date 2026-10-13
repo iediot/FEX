@@ -199,7 +199,7 @@ public:
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
     // Try L1, no lock needed
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
       return L1Entry.HostCode;
     }
@@ -296,6 +296,15 @@ public:
           // Since we're in C-code, this is safe to update here.
           Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
         }
+#ifdef FEX_IOS_HOST
+        else if (!BigL1Pointer && AveragePerSecond >= BIG_L1_MISS_RATE) {
+          GrantBigL1(Thread, AveragePerSecond);
+        }
+#endif
+#ifdef FEX_IOS_HOST
+      } else if (BigL1Pointer) {
+        // A granted big L1 stays for the thread's life (see GrantBigL1).
+#endif
       } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
         if (CurrentL1Entries > MIN_L1_ENTRIES) {
           CurrentL1Entries >>= 1;
@@ -319,6 +328,61 @@ public:
   }
 
   GuestToHostMap* Shared = nullptr;
+
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: A BIGGER L1 FOR THE FEW HOTTEST THREADS.
+   *
+   * The iOS L1 ceiling is 128K entries (ml363: dozens of threads growing to 1M
+   * dirtied ~1 GB). Stick It to the Stickman's main thread sat at that ceiling
+   * with ~84,000 L1 misses a second in steady gameplay, every one a conflict
+   * (two hot blocks sharing a slot), each a locked L3 lookup of ~0.8 us: 7 % of
+   * the thread, 21-23 % in busy stretches. A thread already at the ceiling and
+   * still missing BIG_L1_MISS_RATE times a second swaps in a fresh 512K-entry L1
+   * (8 MB); at most BIG_L1_MAX_GRANTS threads at once, so the worst case is
+   * ~24 MB more than before. Safe to swap here: this runs on the owning thread
+   * in C++, and both JIT probes reload State.L1Pointer and State.L1Mask on every
+   * lookup. The new table starts zeroed and is filled from L3 under the lock,
+   * like any L1 miss; the old table stays mapped (an invalidation racing the
+   * swap may still write to it) and is freed with the cache.
+   * env.MADEIRA_FEX_BIG_L1 = 0 turns it off. */
+  constexpr static size_t BIG_L1_ENTRIES = 512 * 1024;
+  constexpr static size_t BIG_L1_SIZE = BIG_L1_ENTRIES * 16;
+  constexpr static double BIG_L1_MISS_RATE = 20000.0;
+  constexpr static int BIG_L1_MAX_GRANTS = 4;
+  static inline std::atomic<int> BigL1Grants {0};
+  uintptr_t BigL1Pointer = 0;
+
+  void GrantBigL1(FEXCore::Core::InternalThreadState* Thread, double MissesPerSecond) {
+    static int Enabled = -1;
+    if (Enabled < 0) {
+      const char* E = getenv("MADEIRA_FEX_BIG_L1");
+      Enabled = (E && E[0] == '0') ? 0 : 1;
+    }
+    if (!Enabled) return;
+    int Granted = BigL1Grants.load(std::memory_order_relaxed);
+    do {
+      if (Granted >= BIG_L1_MAX_GRANTS) return;
+    } while (!BigL1Grants.compare_exchange_weak(Granted, Granted + 1, std::memory_order_relaxed));
+    void* Big = FEXCore::Allocator::VirtualAlloc(BIG_L1_SIZE, false, true);
+    if (!Big) {
+      BigL1Grants.fetch_sub(1, std::memory_order_relaxed);
+      return;
+    }
+    FEXCore::Allocator::VirtualName("FEXMem_Lookup_L1_big", Big, BIG_L1_SIZE);
+    // Other threads write this thread's L1 (invalidation, cache clears) only under the
+    // write lock, reading L1Pointer and L1PointerMask separately: swap both under it,
+    // so none can pair the old 2 MB table with the new mask and write past its end.
+    auto lk = Shared->AcquireWriteLock();
+    BigL1Pointer = reinterpret_cast<uintptr_t>(Big);
+    L1Pointer = BigL1Pointer;
+    CurrentL1Entries = BIG_L1_ENTRIES;
+    L1PointerMask = BIG_L1_ENTRIES - 1;
+    Thread->CurrentFrame->State.L1Pointer = L1Pointer;
+    Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+    LogMan::Msg::EFmt("[big-l1] thread at the {}-entry L1 ceiling missing {:.0f}/s: {}-entry L1 at {:#x} (grant {} of {})",
+                      MAX_L1_ENTRIES, MissesPerSecond, BIG_L1_ENTRIES, BigL1Pointer, Granted + 1, BIG_L1_MAX_GRANTS);
+  }
+#endif
 
   // Appends a list of Block {Address} to CodePages [Start, Start + Length)
   // Returns true if new pages are marked as containing code
@@ -348,7 +412,7 @@ public:
   // Invalidates L1/L2 for a given guest block
   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
     // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
       L1Entry.GuestCode = 0;
       // Leave L1Entry.HostCode as is, so that concurrent lookups won't read a null pointer
@@ -405,6 +469,25 @@ public:
   uintptr_t GetL1Pointer() const {
     return L1Pointer;
   }
+
+  /* MADEIRA ml2111: the L1 slot of a guest address. The L1 is direct-mapped and
+   * was indexed by the address's low bits alone, so blocks in different images
+   * whose low 17 bits match evicted each other: [lookup-stats] (ml2110) measured
+   * ~100K L1 misses/s on Stick It to the Stickman's main thread, 99.5% of them
+   * such conflicts, ~1 us each in CompileBlock = 10-16% of the thread. XOR-folding
+   * the bits above the largest L1 (2^17 entries on iOS) into the index spreads
+   * them. The generated probes (Dispatcher.cpp loop top and L2 path,
+   * BranchOps.cpp indirect branch) compute the same function, and every C++
+   * site (find, insert, invalidate) goes through here, so an entry is always
+   * looked up and invalidated in the slot it was written to. */
+  static constexpr unsigned L1IndexFoldShift = 17;
+  static uint64_t L1Index(uint64_t Address) {
+#ifdef FEX_IOS_HOST
+    return Address ^ (Address >> L1IndexFoldShift);
+#else
+    return Address;
+#endif
+  }
   uintptr_t GetScaledL1PointerMask() const {
     return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry));
   }
@@ -437,7 +520,7 @@ private:
     }
 
     // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
     L1Entry.GuestCode = Address;
     L1Entry.HostCode = Entry.HostCode;
 

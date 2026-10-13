@@ -80,7 +80,14 @@ DEF_OP(ExitFunction) {
 
   if (IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
 #ifdef ARCHITECTURE_arm64ec
-    if (NewRIP < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(NewRIP)) {
+    const bool TargetIsEc = NewRIP < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(NewRIP);
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+    // iOS-Madeira ml2400: this answer is baked into the block; a cached copy is only valid while it holds.
+    if (MadeiraCapture.Active) {
+      MadeiraCache::NoteEcQuery(ThreadState, MadeiraCache::EcQueryKind::JitExit, NewRIP, TargetIsEc);
+    }
+#endif
+    if (TargetIsEc) {
       str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
       add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, StaticRegisters[X86State::REG_RSP], 0);
       InsertGuestRIPMove(EC_CALL_CHECKER_PC_REG, NewRIP);
@@ -316,12 +323,25 @@ DEF_OP(ExitFunction) {
 #endif // !FEX_CALLRET_STACK_UNUSED
 
     // L1 Cache
+#ifdef FEX_IOS_HOST
+    // MADEIRA ml2111: the folded slot, LookupCache::L1Index:
+    // ((RIP ^ (RIP >> 17)) << 4) & mask = ((RIP << 4) & mask) ^ ((RIP >> 13) & mask), the scaled mask
+    // having its low 4 bits clear. Only TMP1/TMP2 are free here, so mask and pointer load separately.
+    ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
+    and_(ARMEmitter::Size::i64Bit, TMP1, TMP2, RipReg, ARMEmitter::ShiftType::LSR,
+         LookupCache::L1IndexFoldShift - FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    eor(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1);
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    add(TMP1, TMP1, TMP2);
+#else
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
     // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
     // L1Mask is pre-shifted.
     and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
     add(TMP1, TMP1, TMP2);
+#endif
 
     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);
 

@@ -19,16 +19,22 @@
 // The JIT emitters read the same offset at runtime via IosTebTsdOffset.
 #ifdef FEX_IOS_HOST
 .arch_extension lse   // ml1131: stadd/ldadd for the transition probe counters
-// ml1131: add 1 to the sp-sharded counter at IosXpFex + \off. Clobbers \a, \b.
+// ml1132: diagnostics default off; one flag load+branch avoids every shared atomic.
+// Add 1 to the sp-sharded counter at IosXpFex + \off. Clobbers \a, \b.
 .macro IOS_XP_COUNT off, a, b
+  adrp \a, IosXpEnabled
+  ldr \b, [\a, #:lo12:IosXpEnabled]
+  cbz \b, 99f
   adrp \a, IosXpFex
   add \a, \a, #:lo12:IosXpFex
   mov \b, sp
   ubfx \b, \b, #16, #4
   add \a, \a, \b, lsl #6
-  add \a, \a, #\off
+  mov \b, #\off
+  add \a, \a, \b
   mov \b, #1
   stadd \b, [\a]
+99:
 .endm
 .macro IOS_LOAD_TEB reg
   mrs \reg, TPIDRRO_EL0
@@ -125,37 +131,57 @@ ExitToX64:
   // x4/x9 are spilled to free loop registers; restored on every exit path.
   // (Native EC callers keep sp 16-aligned at call boundaries per AAPCS.)
   stp x4, x9, [sp, #-16]!
-  // ml1116: last-hit entry first, then the table newest-first.
-  adrp x16, IosAliasLast
-  ldr x16, [x16, #:lo12:IosAliasLast]
-  cbz x16, ios_ffs_xlate_walk
-  ldr x4, [x16, #8]      // Entry.JitBase
-  sub x4, x17, x4
-  ldr x23, [x16, #16]    // Entry.Size
-  cmp x4, x23
-  b.lo ios_ffs_xlate_hit
+  // ml1132: reverse direct cache; readers never write a shared cache line.
+  adrp x16, IosAliasJitCache
+  add x16, x16, #:lo12:IosAliasJitCache
+  lsr x23, x17, #16
+  and x23, x23, #0x3fff
+  add x16, x16, x23, lsl #4
+  ldar x9, [x16]
+  tbnz x9, #0, ios_ffs_xlate_walk
+  ldr x4, [x16, #8]
+  ldar x23, [x16]
+  cmp x9, x23
+  b.ne ios_ffs_xlate_walk
+  lsr x23, x23, #16
+  cmp x23, x17, lsr #16
+  b.ne ios_ffs_xlate_walk
+  add x17, x17, x4
+  b ios_ffs_xlate_done
 ios_ffs_xlate_walk:
+  IOS_XP_COUNT 37120, x16, x9 // ml1132: JIT->PE cache miss/table walk
+  str x17, [sp, #-16]!
   adrp x9, IosAliasCount
-  ldr w9, [x9, #:lo12:IosAliasCount]
+  add x9, x9, #:lo12:IosAliasCount
+  ldar w9, [x9]
   adrp x16, IosAliasEntries
   add x16, x16, #:lo12:IosAliasEntries
   add x16, x16, x9, lsl #5   // one past the last entry
 ios_ffs_xlate_loop:
-  cbz w9, ios_ffs_xlate_done
+  cbz w9, ios_ffs_xlate_miss
   sub x16, x16, #32
   sub w9, w9, #1
+  add x16, x16, #24
+  ldar x17, [x16]        // Entry.Generation
+  sub x16, x16, #24
+  tbnz x17, #0, ios_ffs_xlate_loop
   ldr x4, [x16, #8]      // Entry.JitBase
-  sub x4, x17, x4
+  ldr x23, [sp]           // original target
+  sub x4, x23, x4
   ldr x23, [x16, #16]    // Entry.Size
   cmp x4, x23
-  b.lo ios_ffs_xlate_hit_walk
-  b ios_ffs_xlate_loop
-ios_ffs_xlate_hit_walk:
-  adrp x23, IosAliasLast
-  str x16, [x23, #:lo12:IosAliasLast]
-ios_ffs_xlate_hit:
+  b.hs ios_ffs_xlate_loop
+  add x16, x16, #24
+  ldar x23, [x16]
+  sub x16, x16, #24
+  cmp x17, x23
+  b.ne ios_ffs_xlate_loop
   ldr x23, [x16]         // Entry.PeBase
   add x17, x23, x4       // target in PE space
+  add sp, sp, #16
+  b ios_ffs_xlate_done
+ios_ffs_xlate_miss:
+  ldr x17, [sp], #16
 ios_ffs_xlate_done:
   IOS_LOAD_TEB x16
   ldr x16, [x16, #0x60]  // TEB->PEB
@@ -282,9 +308,12 @@ ExitFunctionEC:
 #endif
 1:
 #ifdef FEX_IOS_HOST
-  // ml1131: count this x64->EC call (x9 = target as the caller addressed it) and
+  // ml1131/1132: when MADEIRA_FEX_XP=1, count this x64->EC call and
   // append every 64th target of a shard to the ring. x4 (x64 R10, volatile at a
   // call boundary), x16, x17 and x23 are clobbered on every path below anyway.
+  adrp x16, IosXpEnabled
+  ldr x16, [x16, #:lo12:IosXpEnabled]
+  cbz x16, 2f
   adrp x16, IosXpFex
   add x16, x16, #:lo12:IosXpFex
   mov x23, sp
@@ -324,37 +353,56 @@ ExitFunctionSuspendResumePoint:
   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
   // regardless.
-  // ml1116: last-hit entry first, then the table newest-first.
-  adrp x16, IosAliasLast
-  ldr x16, [x16, #:lo12:IosAliasLast]
-  cbz x16, ios_ec_xlate_walk
-  ldr x23, [x16]        // Entry.PeBase
-  sub x23, x9, x23
-  ldr x4, [x16, #16]    // Entry.Size
-  cmp x23, x4
-  b.lo ios_ec_xlate_hit
+  // ml1132: read-only direct cache. The tag contains page key + generation;
+  // reading it twice makes concurrent registration safe without hot-path writes.
+  adrp x16, IosAliasPeCache
+  add x16, x16, #:lo12:IosAliasPeCache
+  lsr x17, x9, #16
+  and x17, x17, #0x3fff
+  add x16, x16, x17, lsl #4
+  ldar x17, [x16]
+  tbnz x17, #0, ios_ec_xlate_walk
+  ldr x23, [x16, #8]
+  ldar x4, [x16]
+  cmp x17, x4
+  b.ne ios_ec_xlate_walk
+  lsr x4, x4, #16
+  cmp x4, x9, lsr #16
+  b.ne ios_ec_xlate_walk
+  add x9, x9, x23
+  b ios_ec_xlate_done
 ios_ec_xlate_walk:
+  IOS_XP_COUNT 36096, x16, x17 // ml1132: PE->JIT cache miss/table walk
+  // No stack use here: sp is the x64 stack and may be only 8-byte aligned
+  // (an x64 call just pushed its return address), and an ARM64 store through
+  // a misaligned sp faults. x9 (target) is kept intact until a hit; the walk
+  // runs on x16 (entry), x17 (temp), x23 (generation) and x4 (offset).
   adrp x17, IosAliasCount
-  ldr w17, [x17, #:lo12:IosAliasCount]
+  add x17, x17, #:lo12:IosAliasCount
+  ldar w17, [x17]
   adrp x16, IosAliasEntries
   add x16, x16, #:lo12:IosAliasEntries
   add x16, x16, x17, lsl #5   // one past the last entry
 ios_ec_xlate_loop:
-  cbz w17, ios_ec_xlate_done
+  adrp x17, IosAliasEntries
+  add x17, x17, #:lo12:IosAliasEntries
+  cmp x16, x17
+  b.ls ios_ec_xlate_done      // walked past the first entry: no mapping
   sub x16, x16, #32
-  sub w17, w17, #1
-  ldr x23, [x16]        // Entry.PeBase
-  sub x23, x9, x23      // offset into image (unsigned-wraps huge if below base)
-  ldr x4, [x16, #16]    // Entry.Size
-  cmp x23, x4
-  b.lo ios_ec_xlate_hit_walk
-  b ios_ec_xlate_loop
-ios_ec_xlate_hit_walk:
-  adrp x4, IosAliasLast
-  str x16, [x4, #:lo12:IosAliasLast]
-ios_ec_xlate_hit:
-  ldr x4, [x16, #8]     // Entry.JitBase
-  add x9, x4, x23
+  add x17, x16, #24
+  ldar x23, [x17]       // Entry.Generation
+  tbnz x23, #0, ios_ec_xlate_loop
+  ldr x4, [x16]         // Entry.PeBase
+  sub x4, x9, x4        // offset into image (unsigned-wraps huge if below base)
+  ldr x17, [x16, #16]   // Entry.Size
+  cmp x4, x17
+  b.hs ios_ec_xlate_loop
+  add x17, x16, #24
+  ldar x17, [x17]       // generation unchanged while we read the entry
+  cmp x17, x23
+  b.ne ios_ec_xlate_loop
+  ldr x17, [x16, #8]    // Entry.JitBase
+  add x9, x17, x4
 ios_ec_xlate_done:
 #endif
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).

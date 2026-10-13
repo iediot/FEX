@@ -60,7 +60,23 @@ public:
     Relocations.clear();
   }
 
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  [[nodiscard]]
+  CPUBackend::CompiledCode InstallCachedCode(uint64_t Entry, const uint8_t* Code, uint32_t Size, const fextl::vector<uint64_t>& LinkerLiteralOffsets,
+                                             const fextl::vector<std::pair<uint64_t, uint32_t>>& Entries,
+                                             FEXCore::Core::DebugData* DebugData) override;
+#endif
+
 private:
+  // Moves a finished block from the temp buffer into the current CodeBuffer (shared by
+  // CompileCode and ml2400 InstallCachedCode). The emitter must sit on the temp buffer with its
+  // cursor at the block end; CodeData must describe the block in the temp buffer.
+  [[nodiscard]]
+  CPUBackend::CompiledCode PublishTempCode(uint8_t* TempCodeBuffer, uint8_t* CodeBegin, uint64_t CodeOnlySize, size_t PrevNumAllocations);
+
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  void MadeiraCaptureBlock(const uint8_t* TempCodeBuffer, size_t Size, size_t PrevNumAllocations);
+#endif
   const bool HostSupportsSVE128 {};
   const bool HostSupportsSVE256 {};
   const bool HostSupportsAVX256 {};

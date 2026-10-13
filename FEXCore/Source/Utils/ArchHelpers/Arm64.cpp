@@ -2329,13 +2329,14 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   // thread identity into the word (waiters only ever test zero/nonzero); on
   // timeout, emulate this one access with the same helpers the !IsJIT path
   // uses and leave the code unpatched.
-#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
+#if defined(FEX_IOS_HOST)
   /* The backpatch lock lives in the code buffer, which is execute-only on iOS: JITCodeTail is
    * emitted after each block, so &SpinLockFutex is in the dual-mapped pool's RX view. The
    * LDAXR/STLXR acquire below would take a permission fault on the store, inside this handler.
    * Take the WHOLE lock through the writable alias (both views map the same physical page, so the
-   * exclusive pair is a genuine atomic, and every participant uses this one address). Scoped to
-   * the WOW64 module; the ARM64EC module is unchanged. */
+   * exclusive pair is a genuine atomic, and every participant uses this one address). Both the
+   * WOW64 and the ARM64EC module: the ARM64EC one faulted here (BUS: unhandled store, stlxr into
+   * JIT-POOL-RX) once RimWorld with its DLC reached an unaligned atomic. */
   uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
 #else
   uint32_t* BPFutex = &InlineTail->SpinLockFutex;
