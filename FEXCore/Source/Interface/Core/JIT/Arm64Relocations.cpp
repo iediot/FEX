@@ -98,7 +98,15 @@ void Arm64JITCore::InsertGuestRIPMove(ARMEmitter::Register Reg, uint64_t Constan
   // TODO: Force 6-byte `MaxSize`, with sign extension to 64-bit. Current code not smart enough to handle negatives.
   // 48-bit sign extension works because x86-64 guests only receive 47-bit VA space, with 48-bit being reserved for kernel.
   // Additional quirk, "canonical" 48-bit pointers on x86-64, sign extend the 48-bit as well (Which is why kernel pointers are negative).
-  LoadConstant(ARMEmitter::Size::i64Bit, Reg, Constant, FEXCore::CPU::Arm64Emitter::PadType::AUTOPAD);
+  auto Pad = FEXCore::CPU::Arm64Emitter::PadType::AUTOPAD;
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  // iOS-Madeira: always four instructions while the persistent code cache is on, so a
+  // cached block can be re-emitted for the module at another load base (RebaseRecord).
+  if (FEXCore::MadeiraCache::g_State.load(std::memory_order_relaxed) == 1) {
+    Pad = FEXCore::CPU::Arm64Emitter::PadType::DOPAD;
+  }
+#endif
+  LoadConstant(ARMEmitter::Size::i64Bit, Reg, Constant, Pad);
   Relocations.emplace_back(MoveABI);
 }
 

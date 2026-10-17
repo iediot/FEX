@@ -59,7 +59,7 @@ std::atomic<bool> g_WorkPending {false};
 
 namespace {
 constexpr uint32_t FILE_MAGIC = 0x4346464d;   // "MFFC"
-constexpr uint32_t FILE_VERSION = 1;
+constexpr uint32_t FILE_VERSION = 2; // 2: guest addresses stored relative to the module base
 constexpr uint32_t RECORD_MAGIC = 0x314b4c42; // "BLK1"
 constexpr uint32_t MAX_RECORD_SIZE = 1u << 20;
 constexpr uint64_t MAX_RANGE_SIZE = 1u << 16;
@@ -377,7 +377,8 @@ bool EcAnswer(uint64_t Query) {
 }
 
 fextl::string FilePath(const ModuleCache& M) {
-  return fextl::fmt::format("{}\\{}-{:016x}-{:x}.mfc", g_Dir, M.Name, M.FileId, M.Base);
+  // No load base in the name: records are base-relative, so one file serves every base.
+  return fextl::fmt::format("{}\\{}-{:016x}.mfc", g_Dir, M.Name, M.FileId);
 }
 
 ModuleCache* FindModule(uint64_t K) {
@@ -416,10 +417,11 @@ ModuleCache* FindOrRequestModule(const FEXCore::ExecutableFileSectionInfo& Secti
 }
 
 /* Record checksums are seeded with the file identity, so a record can only ever
- * validate inside a file of the same FEX build/config and module at the same base,
- * even if another process rewrites the file under a reader's index. */
+ * validate inside a file of the same FEX build/config and module, even if another
+ * process rewrites the file under a reader's index. The base is not part of it:
+ * records are stored relative to the module base (RebaseRecord). */
 uint64_t RecordSeed(const ModuleCache& M) {
-  return g_ConfigHash ^ M.FileId ^ (M.Base * 0x9E3779B97F4A7C15ULL);
+  return g_ConfigHash ^ M.FileId;
 }
 
 FileHeader ExpectedHeader(const ModuleCache& M) {
@@ -428,7 +430,7 @@ FileHeader ExpectedHeader(const ModuleCache& M) {
   H.Version = FILE_VERSION;
   H.ConfigHash = g_ConfigHash;
   H.FileId = M.FileId;
-  H.FileStartVA = M.Base;
+  H.FileStartVA = 0; // records are base-relative
   H.ImageSize = M.End - M.Begin;
   return H;
 }
@@ -473,7 +475,7 @@ void LoadModule(ModuleCache& M) {
             Off + R.TotalSize > FileSize) {
           break; // torn or foreign tail: everything from here is cut on the next write
         }
-        Index[R.GuestRIP] = {Off, R.TotalSize, false};
+        Index[R.GuestRIP + M.Base] = {Off, R.TotalSize, false};
         Off += R.TotalSize;
         M.ValidEnd = Off;
       }
@@ -567,7 +569,7 @@ void FlushModule(ModuleCache& M, const char* Why) {
     for (size_t Off = 0; Off + sizeof(RecordHeader) <= Out.size();) {
       RecordHeader R;
       memcpy(&R, Out.data() + Off, sizeof(R));
-      M.Index[R.GuestRIP] = {At + Off, R.TotalSize, false};
+      M.Index[R.GuestRIP + M.Base] = {At + Off, R.TotalSize, false};
       Off += R.TotalSize;
     }
   }
@@ -620,6 +622,161 @@ bool ReadRecord(ModuleCache& M, const IndexEntry& E, fextl::vector<uint8_t>& Buf
   return MadeiraFexCacheRead(M.Reader, E.Offset, Buf.data(), E.Size) == static_cast<int64_t>(E.Size);
 }
 
+/* The exact instructions Arm64Emitter::LoadConstant emits for a 64-bit DOPAD move,
+ * which is what InsertGuestRIPMove produces while the cache is on: re-emitting a
+ * RIP move for a new base gives the bytes a fresh compile would, so VERIFY still
+ * compares byte for byte. */
+void EncodeRIPMove(uint32_t Rd, uint64_t C, uint32_t Out[4]) {
+  constexpr uint32_t NOP = 0xD503201F, MOVZ = 0xD2800000, MOVK = 0xF2800000, MOVN = 0x92800000, ORR_IMM = 0xB2000000;
+  int N = 0;
+  auto Emit = [&](uint32_t I) { Out[N++] = I; };
+  auto Wide = [&](uint32_t Op, uint64_t Imm, uint32_t Shift) { Emit(Op | ((Shift / 16) << 21) | (uint32_t(Imm & 0xFFFF) << 5) | Rd); };
+  if (((~C) >> 16) == 0) {
+    Emit(NOP), Emit(NOP), Emit(NOP), Wide(MOVN, ~C, 0);
+    return;
+  }
+  int Required = 0;
+  for (int i = 0; i < 4; ++i) {
+    Required += ((C >> (i * 16)) & 0xFFFF) != 0;
+  }
+  uint32_t n, imms, immr;
+  if (Required > 1 && ARMEmitter::Emitter::IsImmLogical(C, 64, &n, &imms, &immr)) {
+    Emit(NOP), Emit(NOP), Emit(NOP), Emit(ORR_IMM | (n << 22) | (immr << 16) | (imms << 10) | (31u << 5) | Rd);
+    return;
+  }
+  if (((~C) >> 32) == 0) {
+    Emit(NOP), Emit(NOP), Wide(MOVN, ~C, 0), Wide(MOVK, C >> 16, 16);
+    return;
+  }
+  int Seg = 0;
+  for (; Seg < 4; ++Seg) {
+    if ((C >> (Seg * 16)) & 0xFFFF) {
+      Wide(MOVZ, C >> (Seg * 16), Seg * 16);
+      ++Seg;
+      break;
+    }
+  }
+  for (; Seg < 4; ++Seg) {
+    if ((C >> (Seg * 16)) & 0xFFFF) {
+      Wide(MOVK, C >> (Seg * 16), Seg * 16);
+    }
+  }
+  if (N == 0) {
+    Wide(MOVZ, 0, 0);
+  }
+  while (N < 4) {
+    Emit(NOP);
+  }
+}
+
+/* Moves every guest address in a record between this load (absolute) and the file
+ * (relative to the module base). ToFile also proves the block is relocatable: each
+ * RIP move must be the padded four-instruction form, and each RIP-derived value must
+ * be within 2 GB of the block (a 32-bit masked EntrypointOffset is not). On load the
+ * literals are rewritten and the moves re-emitted for this base. */
+bool RebaseRecord(uint8_t* Buf, size_t Size, uint64_t Base, bool ToFile) {
+  if (Size < sizeof(RecordHeader)) {
+    return false;
+  }
+  RecordHeader H;
+  memcpy(&H, Buf, sizeof(H));
+  const uint64_t Need = sizeof(RecordHeader) + uint64_t(H.NumRanges) * sizeof(GuestRange) + uint64_t(H.NumCodePages) * 8 +
+                        uint64_t(H.NumEntries) * sizeof(EntryRec) + uint64_t(H.NumGuestEntryPoints) * 8 +
+                        uint64_t(H.NumRelocs) * sizeof(RelocRec) + uint64_t(H.NumEcQueries) * sizeof(EcRec) + AlignUp(H.CodeSize, 8);
+  if (Need != Size || H.TotalSize != Size) {
+    return false;
+  }
+  auto Move = [&](uint64_t V) { return ToFile ? V - Base : V + Base; };
+  const uint64_t BlockRIP = H.GuestRIP; // in the frame the record is in now
+  auto Near = [&](uint64_t V) { return uint64_t(int64_t(V - BlockRIP) + (int64_t(1) << 31)) < (uint64_t(1) << 32); };
+  uint8_t* Cur = Buf + sizeof(RecordHeader);
+  auto* Ranges = reinterpret_cast<GuestRange*>(Cur);
+  Cur += H.NumRanges * sizeof(GuestRange);
+  auto* Pages = reinterpret_cast<uint64_t*>(Cur);
+  Cur += H.NumCodePages * 8;
+  auto* Entries = reinterpret_cast<EntryRec*>(Cur);
+  Cur += H.NumEntries * sizeof(EntryRec);
+  auto* EntryPoints = reinterpret_cast<uint64_t*>(Cur);
+  Cur += H.NumGuestEntryPoints * 8;
+  auto* Relocs = reinterpret_cast<RelocRec*>(Cur);
+  Cur += H.NumRelocs * sizeof(RelocRec);
+  auto* Ec = reinterpret_cast<EcRec*>(Cur);
+  Cur += H.NumEcQueries * sizeof(EcRec);
+  uint8_t* Code = Cur;
+
+  for (uint32_t i = 0; i < H.NumRelocs; ++i) {
+    auto& R = Relocs[i];
+    const auto Kind = static_cast<RelocKind>(R.Kind);
+    if (Kind != RelocKind::GuestRIPLiteral && Kind != RelocKind::GuestRIPMove) {
+      continue;
+    }
+    if (ToFile && !Near(R.Value)) {
+      return false;
+    }
+    if (Kind == RelocKind::GuestRIPLiteral) {
+      uint64_t V;
+      if (uint64_t(R.Offset) + 8 > H.CodeSize) {
+        return false;
+      }
+      memcpy(&V, Code + R.Offset, 8);
+      if (V != R.Value) {
+        return false;
+      }
+      R.Value = Move(R.Value);
+      memcpy(Code + R.Offset, &R.Value, 8);
+    } else {
+      uint32_t Old[4], Want[4];
+      if (uint64_t(R.Offset) + 16 > H.CodeSize) {
+        return false;
+      }
+      memcpy(Old, Code + R.Offset, 16);
+      uint32_t Rd = 32;
+      for (uint32_t I : Old) {
+        if (I != 0xD503201F) {
+          Rd = I & 31;
+          break;
+        }
+      }
+      if (Rd == 32) {
+        return false;
+      }
+      if (ToFile) {
+        EncodeRIPMove(Rd, R.Value, Want);
+        if (memcmp(Old, Want, 16) != 0) {
+          return false; // not the padded form: compiled before the cache was on
+        }
+      }
+      R.Value = Move(R.Value);
+      if (!ToFile) {
+        EncodeRIPMove(Rd, R.Value, Want);
+        memcpy(Code + R.Offset, Want, 16);
+      }
+    }
+  }
+  for (uint32_t i = 0; i < H.NumEcQueries; ++i) {
+    const uint64_t Kind = Ec[i].Query & (1ULL << 63), Addr = Ec[i].Query & ~(1ULL << 63);
+    if (ToFile && !Near(Addr)) {
+      return false;
+    }
+    Ec[i].Query = (Move(Addr) & ~(1ULL << 63)) | Kind;
+  }
+  for (uint32_t i = 0; i < H.NumRanges; ++i) {
+    Ranges[i].Start = Move(Ranges[i].Start);
+  }
+  for (uint32_t i = 0; i < H.NumCodePages; ++i) {
+    Pages[i] = Move(Pages[i]);
+  }
+  for (uint32_t i = 0; i < H.NumEntries; ++i) {
+    Entries[i].Guest = Move(Entries[i].Guest);
+  }
+  for (uint32_t i = 0; i < H.NumGuestEntryPoints; ++i) {
+    EntryPoints[i] = Move(EntryPoints[i]);
+  }
+  H.GuestRIP = Move(H.GuestRIP);
+  memcpy(Buf, &H, sizeof(H));
+  return true;
+}
+
 struct ParsedRecord {
   const RecordHeader* H;
   const GuestRange* Ranges;
@@ -632,7 +789,8 @@ struct ParsedRecord {
 };
 
 // Structure, bounds and self-consistency. Everything checked against the CURRENT process is separate.
-bool ParseRecord(const fextl::vector<uint8_t>& Buf, uint64_t GuestRIP, const ModuleCache& M, ParsedRecord& P, Reject& Why) {
+// Rebased: Buf already went through this (TryInstall, then SealCapture's verify compare).
+bool ParseRecord(fextl::vector<uint8_t>& Buf, uint64_t GuestRIP, const ModuleCache& M, ParsedRecord& P, Reject& Why, bool Rebased) {
   Why = R_LAYOUT;
   if (Buf.size() < sizeof(RecordHeader)) {
     return false;
@@ -642,9 +800,14 @@ bool ParseRecord(const fextl::vector<uint8_t>& Buf, uint64_t GuestRIP, const Mod
   if (H.Magic != RECORD_MAGIC || H.TotalSize != Buf.size()) {
     return false;
   }
-  if (XXH3_64bits_withSeed(Buf.data() + 16, Buf.size() - 16, RecordSeed(M)) != H.Checksum) {
-    Why = R_CHECKSUM;
-    return false;
+  if (!Rebased) {
+    if (XXH3_64bits_withSeed(Buf.data() + 16, Buf.size() - 16, RecordSeed(M)) != H.Checksum) {
+      Why = R_CHECKSUM;
+      return false;
+    }
+    if (!RebaseRecord(Buf.data(), Buf.size(), M.Base, false)) {
+      return false;
+    }
   }
   const uint64_t Need = sizeof(RecordHeader) + uint64_t(H.NumRanges) * sizeof(GuestRange) + uint64_t(H.NumCodePages) * 8 +
                         uint64_t(H.NumEntries) * sizeof(EntryRec) + uint64_t(H.NumGuestEntryPoints) * 8 +
@@ -701,7 +864,7 @@ bool ParseRecord(const fextl::vector<uint8_t>& Buf, uint64_t GuestRIP, const Mod
       }
       break;
     case RelocKind::GuestRIPLiteral: {
-      // The literal must already hold the RIP: same base, nothing to rebase. A mismatch means a corrupt record.
+      // RebaseRecord wrote the literal for this base. A mismatch means a corrupt record.
       uint64_t V;
       if (uint64_t(R.Offset) + 8 > H.CodeSize) {
         return false;
@@ -796,7 +959,7 @@ void PatchRelocs(FEXCore::Context::ContextImpl* CTX, const ParsedRecord& P, uint
       const uint64_t V = FEXCore::CPU::GetNamedSymbolLiteral(*CTX, FEXCore::CPU::RelocNamedSymbolLiteral::NamedSymbol::SYMBOL_LITERAL_EXITFUNCTION_LINKER);
       memcpy(Code + R.Offset, &V, 8);
     }
-    // Guest RIP literals/moves: the module is at the recorded base, the values already hold.
+    // Guest RIP literals/moves were rewritten for this base by RebaseRecord.
   }
 }
 } // namespace
@@ -894,7 +1057,7 @@ bool TryInstall(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThrea
   }
   ParsedRecord P;
   Reject Why;
-  if (!ParseRecord(C.Scratch, GuestRIP, *M, P, Why)) {
+  if (!ParseRecord(C.Scratch, GuestRIP, *M, P, Why, false)) {
     MarkRejected(*M, GuestRIP);
     CountReject(Why);
     return false;
@@ -1001,7 +1164,7 @@ void SealCapture(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThre
     Reject Why;
     auto Section = CTX->SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
     ModuleCache* M = Section ? FindOrRequestModule(*Section) : nullptr;
-    if (!M || !ParseRecord(C.Scratch, GuestRIP, *M, P, Why)) {
+    if (!M || !ParseRecord(C.Scratch, GuestRIP, *M, P, Why, true)) {
       return;
     }
     fextl::vector<uint8_t> Patched(P.Code, P.Code + P.H->CodeSize);
@@ -1142,6 +1305,11 @@ void Record(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThreadSta
   }
   Put(C.Code.data(), C.Code.size());
   memcpy(Rec.data(), &H, sizeof(H));
+  if (!RebaseRecord(Rec.data(), Rec.size(), M->Base, true)) {
+    Bump(g_Stats.RecordSkipped);
+    return;
+  }
+  memcpy(&H, Rec.data(), sizeof(H));
   H.Checksum = XXH3_64bits_withSeed(Rec.data() + 16, Rec.size() - 16, RecordSeed(*M));
   memcpy(Rec.data(), &H, sizeof(H));
 
