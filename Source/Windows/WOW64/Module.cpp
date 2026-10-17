@@ -2210,4 +2210,6 @@ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr) {
 extern "C" int IosSubfloorWindowForCode(uint64_t, uint64_t*, uint64_t*, uint64_t*) {
   return 0;
 }
+// Precompile is ARM64EC only (32-bit games keep translating as they run).
+extern "C" void MadeiraFexPrecompileRun(FEXCore::Core::InternalThreadState*) {}
 #endif

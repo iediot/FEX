@@ -426,9 +426,31 @@ void InitSyscalls() {
   PatchCallChecker();
 }
 
+bool PrecompileRequested() {
+  static const bool On = [] {
+    const char* E = getenv("MADEIRA_FEX_PRECOMPILE");
+    return E && E[0] == '1';
+  }();
+  return On;
+}
+struct PrecompileImage {
+  uint64_t Base;
+  fextl::string Path;
+  bool Main;
+};
+std::mutex PrecompileImagesLock;
+fextl::vector<PrecompileImage>* PrecompileImages;
+
 void HandleImageMap(uint64_t Address, bool MainImage = false) {
   fextl::string ModulePath = FEX::Windows::GetSectionFilePath(Address);
   fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
+  if (PrecompileRequested()) {
+    std::scoped_lock lk(PrecompileImagesLock);
+    if (!PrecompileImages) {
+      PrecompileImages = new fextl::vector<PrecompileImage>;
+    }
+    PrecompileImages->push_back({Address, ModulePath, MainImage});
+  }
   InvalidationTracker->HandleImageMap(ModuleName, Address);
   ImageTracker->HandleImageMap(ModulePath, Address, MainImage);
 }
@@ -1149,6 +1171,151 @@ NTSTATUS ProcessInit() {
  * terminating the other threads): write the persistent code cache's pending
  * blocks. No-op unless MADEIRA_FEX_CODE_CACHE=1. */
 extern "C" void MadeiraFexCodeCacheProcessTerm();
+extern "C" void MadeiraFexCodeCacheFlushNow();
+extern "C" void* MadeiraFexCacheOpen(const char* DosPath, int ForWrite, uint64_t* SizeOut);
+extern "C" int64_t MadeiraFexCacheWrite(void* Handle, uint64_t Offset, const void* Buffer, uint32_t Size);
+extern "C" int MadeiraFexCacheSetEnd(void* Handle, uint64_t Size);
+extern "C" void MadeiraFexCacheClose(void* Handle);
+extern "C" int MadeiraFexCacheMakeDir(const char* DosPath);
+extern "C" int64_t MadeiraFexCacheRead(void* Handle, uint64_t Offset, void* Buffer, uint32_t Size);
+extern "C" uint64_t MadeiraFexCodeCacheConfigHash();
+
+/* iOS-Madeira: "Preparing game" (MADEIRA_FEX_PRECOMPILE=1, with the code cache on).
+ * Called from the process's first CompileBlock, once the exe and its static imports are
+ * mapped and before any of their code has run: translate every function the x64 game
+ * images list in .pdata into the cache, then let the game start. Without it the first
+ * launch JIT-compiled through its loading screens. Once per exe and FEX codegen (a marker
+ * file <exe>.precompiled holds the cache config hash and the exe's PE stamp). Wine's own
+ * DLLs (C:\windows) are ARM64EC and skipped. Progress for the app's overlay goes to
+ * <cache dir>\precompile-progress.txt as "done total module"; the app creates
+ * precompile-skip to stop early (no marker then: offered again next launch).
+ * Single-threaded: every compile runs on this thread's FEX state. */
+extern "C" void MadeiraFexPrecompileRun(FEXCore::Core::InternalThreadState* Thread) {
+  struct Func {
+    uint64_t Rip;
+    uint32_t Image;
+  };
+  fextl::vector<PrecompileImage> Images;
+  {
+    std::scoped_lock lk(PrecompileImagesLock);
+    if (PrecompileImages) {
+      Images = *PrecompileImages;
+    }
+  }
+  const char* DirEnv = getenv("MADEIRA_FEX_CACHE_DIR");
+  const fextl::string Dir = (DirEnv && DirEnv[0]) ? DirEnv : "C:\\users\\Public\\madeira-fex-cache";
+  fextl::string Marker;
+  char Stamp[64] {};
+  for (auto& Image : Images) {
+    if (Image.Main) {
+      auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(Image.Base));
+      Marker = Dir + "\\" + fextl::string {FEX::Windows::BaseName(Image.Path)} + ".precompiled";
+      snprintf(Stamp, sizeof(Stamp), "%016llx %08x %08x\n", (unsigned long long)MadeiraFexCodeCacheConfigHash(),
+               Nt ? unsigned(Nt->FileHeader.TimeDateStamp) : 0u, Nt ? unsigned(Nt->OptionalHeader.SizeOfImage) : 0u);
+    }
+  }
+  if (Marker.empty()) {
+    return;
+  }
+  if (void* H = MadeiraFexCacheOpen(Marker.c_str(), 0, nullptr)) {
+    char Have[64] {};
+    const int64_t N = MadeiraFexCacheRead(H, 0, Have, sizeof(Have) - 1);
+    MadeiraFexCacheClose(H);
+    if (N > 0 && !strcmp(Have, Stamp)) {
+      return; // already prepared for this exe and FEX
+    }
+  }
+  const fextl::string SkipFile = Dir + "\\precompile-skip";
+  auto SkipRequested = [&] {
+    void* H = MadeiraFexCacheOpen(SkipFile.c_str(), 0, nullptr);
+    MadeiraFexCacheClose(H);
+    return H != nullptr;
+  };
+  fextl::vector<Func> Funcs;
+  for (uint32_t i = 0; i < Images.size(); ++i) {
+    fextl::string Lower = Images[i].Path;
+    for (auto& C : Lower) {
+      C = (C >= 'A' && C <= 'Z') ? char(C - 'A' + 'a') : C;
+    }
+    if (Lower.find("\\windows\\") != fextl::string::npos) {
+      continue;
+    }
+    auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(Images[i].Base));
+    if (!Nt || Nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 || Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+      continue;
+    }
+    const auto& Dir = Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!Dir.VirtualAddress || Dir.Size < sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)) {
+      continue;
+    }
+    const auto* RF = reinterpret_cast<const IMAGE_RUNTIME_FUNCTION_ENTRY*>(Images[i].Base + Dir.VirtualAddress);
+    const size_t Count = Dir.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+    const size_t Before = Funcs.size();
+    for (size_t f = 0; f < Count; ++f) {
+      if (RF[f].BeginAddress && RF[f].EndAddress > RF[f].BeginAddress && RF[f].BeginAddress < Nt->OptionalHeader.SizeOfImage) {
+        Funcs.push_back({Images[i].Base + RF[f].BeginAddress, i});
+      }
+    }
+    LogMan::Msg::EFmt("[fex-precompile] {} base={:#x}: {} functions", FEX::Windows::BaseName(Images[i].Path), Images[i].Base,
+                      Funcs.size() - Before);
+  }
+  std::sort(Funcs.begin(), Funcs.end(), [](const Func& A, const Func& B) { return A.Rip < B.Rip; });
+  Funcs.erase(std::unique(Funcs.begin(), Funcs.end(), [](const Func& A, const Func& B) { return A.Rip == B.Rip; }), Funcs.end());
+
+  MadeiraFexCacheMakeDir(Dir.c_str());
+  const fextl::string Progress = Dir + "\\precompile-progress.txt";
+  auto WriteProgress = [&](size_t Done, const fextl::string& Module) {
+    char Line[512];
+    const int N = snprintf(Line, sizeof(Line), "%zu %zu %s\n", Done, Funcs.size(), Module.c_str());
+    if (void* H = MadeiraFexCacheOpen(Progress.c_str(), 1, nullptr)) {
+      if (N > 0 && MadeiraFexCacheWrite(H, 0, Line, uint32_t(N)) == N) {
+        MadeiraFexCacheSetEnd(H, uint64_t(N));
+      }
+      MadeiraFexCacheClose(H);
+    }
+  };
+
+  auto Ticks = [] {
+    uint64_t C;
+    __asm volatile("mrs %0, cntvct_el0" : "=r"(C));
+    return C;
+  };
+  uint64_t Freq;
+  __asm volatile("mrs %0, cntfrq_el0" : "=r"(Freq));
+  const uint64_t T0 = Ticks();
+  uint64_t LastProgress = T0, LastFlush = T0;
+  WriteProgress(0, "");
+  bool Skipped = false;
+  for (size_t f = 0; f < Funcs.size(); ++f) {
+    CTX->CompileRIP(Thread, Funcs[f].Rip);
+    const uint64_t Now = Ticks();
+    if (Now - LastFlush >= 5 * Freq) {
+      MadeiraFexCodeCacheFlushNow(); // bounds what is held in memory
+      LastFlush = Now;
+    }
+    if (Now - LastProgress >= Freq / 4) {
+      WriteProgress(f + 1, fextl::string {FEX::Windows::BaseName(Images[Funcs[f].Image].Path)});
+      LastProgress = Now;
+      if (SkipRequested()) {
+        Skipped = true;
+        LogMan::Msg::EFmt("[fex-precompile] skipped by the user at {} of {}", f + 1, Funcs.size());
+        break;
+      }
+    }
+  }
+  MadeiraFexCodeCacheFlushNow();
+  WriteProgress(Funcs.size(), "done");
+  if (!Skipped) {
+    if (void* H = MadeiraFexCacheOpen(Marker.c_str(), 1, nullptr)) {
+      MadeiraFexCacheWrite(H, 0, Stamp, uint32_t(strlen(Stamp)));
+      MadeiraFexCacheSetEnd(H, strlen(Stamp));
+      MadeiraFexCacheClose(H);
+    }
+  }
+  LogMan::Msg::EFmt("[fex-precompile] {}: {} functions from {} images in {:.1f} s", Skipped ? "stopped" : "done", Funcs.size(),
+                    Images.size(), double(Ticks() - T0) / double(Freq));
+}
+
 void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
 #ifdef FEX_IOS_HOST
   if (!After) {

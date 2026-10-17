@@ -1597,6 +1597,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   auto Thread = Frame->Thread;
+#ifdef MADEIRA_FEX_CODE_CACHE_BUILD
+  MadeiraCache::MaybePrecompile(this, Thread);
+#endif
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
 #ifdef FEX_IOS_HOST

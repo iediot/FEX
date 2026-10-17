@@ -3,6 +3,7 @@
  * the exact list of what is and is not cached: MadeiraCodeCache.h. */
 
 #include "Interface/Core/MadeiraCodeCacheHooks.h"
+#include "Interface/Core/MadeiraCodegenId.h"
 
 #ifdef MADEIRA_FEX_CODE_CACHE_BUILD
 #include "Interface/Context/Context.h"
@@ -47,11 +48,13 @@ int MadeiraFexCacheSetEnd(void* Handle, uint64_t Size);
 void MadeiraFexCacheClose(void* Handle);
 int MadeiraFexCacheMakeDir(const char* DosPath);
 void MadeiraFexCacheProcessName(char* Out, uint32_t Size);
+const void* MadeiraFexCacheMap(void* Handle, uint64_t Size);
+void MadeiraFexCacheUnmap(const void* View);
+// The frontend's precompile pass (ARM64EC Module.cpp; a no-op stub under WOW64).
+void MadeiraFexPrecompileRun(FEXCore::Core::InternalThreadState* Thread);
 // ml954 sub-floor windows (ARM64EC IosJitAlias.cpp; WOW64 Module.cpp stubs).
 int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* Size, uint64_t* Real);
 uint64_t IosSubfloorToReal(uint64_t Addr);
-// This DLL's own image: its PE timestamp/size identify the FEX build.
-extern const uint8_t __ImageBase[];
 }
 
 namespace FEXCore::MadeiraCache {
@@ -155,10 +158,16 @@ struct ModuleCache {
   fextl::vector<uint8_t> Pending;
   uint32_t PendingBlocks {};
   bool Full {};
-  // The file's valid bytes, read once at the safe point: installing a block makes
-  // no syscall while compile holds the code invalidation lock (an NtReadFile there
-  // deadlocked Steam's dock against a heap-lock holder waiting to invalidate).
-  fextl::vector<uint8_t> Data;
+  // The file as loaded, mapped read-only once at the safe point, then records this
+  // process wrote (from TailStart on). Installing a block makes no syscall while compile
+  // holds the code invalidation lock (an NtReadFile there deadlocked Steam's dock against
+  // a heap-lock holder waiting to invalidate); a page fault on the view takes no Wine lock.
+  // Mapped, not copied: a precompiled exe's file runs to hundreds of MB, which as heap
+  // would count against the game's memory limit.
+  const uint8_t* Map {};
+  uint64_t MapSize {};
+  fextl::vector<uint8_t> Tail;
+  uint64_t TailStart {};
 
   // Owned by the DoPendingWork / final-flush caller (g_Busy).
   void* Writer {};
@@ -173,7 +182,7 @@ std::atomic<bool> g_Busy {false};
 std::atomic<size_t> g_PendingTotal {0};
 std::atomic<uint64_t> g_LastFlushTick {0};
 uint64_t g_ConfigHash {};
-uint64_t g_MaxFileBytes {256u << 20};
+uint64_t g_MaxFileBytes {1024u << 20}; // files are mapped, not copied: size costs disk, not memory
 bool g_Verify {};
 fextl::string g_Dir;
 
@@ -262,22 +271,14 @@ struct Hasher {
 };
 
 /* Everything that can make the same guest bytes translate differently: the FEX
- * build itself, the context's effective codegen config, and the host features.
- * A change in any of them retires every file (header mismatch -> rewritten). */
+ * sources that affect codegen (MADEIRA_CODEGEN_ID, not the DLL's timestamp, so an
+ * app update that leaves codegen alone keeps every user's cache), the context's
+ * effective codegen config, and the host features. A change in any of them retires
+ * every file (header mismatch -> rewritten). */
 uint64_t ComputeConfigHash(FEXCore::Context::ContextImpl* CTX) {
   Hasher H;
   H.Mix(FILE_VERSION);
-  {
-    // e_lfanew -> IMAGE_NT_HEADERS: TimeDateStamp (+8), SizeOfImage (+24+56), CheckSum (+24+64).
-    uint32_t Lfanew, TimeDateStamp, SizeOfImage, CheckSum;
-    memcpy(&Lfanew, __ImageBase + 0x3c, 4);
-    memcpy(&TimeDateStamp, __ImageBase + Lfanew + 8, 4);
-    memcpy(&SizeOfImage, __ImageBase + Lfanew + 24 + 56, 4);
-    memcpy(&CheckSum, __ImageBase + Lfanew + 24 + 64, 4);
-    H.Mix(TimeDateStamp);
-    H.Mix(SizeOfImage);
-    H.Mix(CheckSum);
-  }
+  H.Mix(uint64_t(MADEIRA_CODEGEN_ID));
   auto& C = CTX->Config;
   H.Mix(C.Is64BitMode());
   H.Mix(C.Multiblock());
@@ -449,31 +450,21 @@ void LoadModule(ModuleCache& M) {
   uint64_t FileSize = 0;
   void* Reader = MadeiraFexCacheOpen(M.Path.c_str(), 0, &FileSize);
   fextl::robin_map<uint64_t, IndexEntry> Index;
-  fextl::vector<uint8_t> Data;
+  const uint8_t* Map = nullptr;
   const char* Why = "no file";
-  if (Reader && FileSize > g_MaxFileBytes) {
-    Why = "file over MADEIRA_FEX_CODE_CACHE_MAX_MB";
-  } else if (Reader && FileSize >= sizeof(FileHeader)) {
-    Data.resize(FileSize);
-    uint64_t Got = 0;
-    while (Got < FileSize) {
-      const uint32_t Want = static_cast<uint32_t>(std::min<uint64_t>(SCAN_CHUNK, FileSize - Got));
-      const int64_t N = MadeiraFexCacheRead(Reader, Got, Data.data() + Got, Want);
-      if (N <= 0) {
-        break;
-      }
-      Got += static_cast<uint64_t>(N);
+  if (Reader && FileSize >= sizeof(FileHeader)) {
+    Map = static_cast<const uint8_t*>(MadeiraFexCacheMap(Reader, FileSize));
+    if (!Map) {
+      Why = "cannot map";
     }
-    FileSize = Got;
-    Data.resize(Got);
   }
   if (Reader) {
     MadeiraFexCacheClose(Reader);
   }
-  if (FileSize >= sizeof(FileHeader) && Data.size() >= sizeof(FileHeader)) {
+  if (Map) {
     FileHeader H {};
     const FileHeader E = ExpectedHeader(M);
-    memcpy(&H, Data.data(), sizeof(H));
+    memcpy(&H, Map, sizeof(H));
     if (H.Magic != FILE_MAGIC || H.Version != FILE_VERSION) {
       Why = "bad header";
     } else if (H.ConfigHash != E.ConfigHash) {
@@ -487,7 +478,7 @@ void LoadModule(ModuleCache& M) {
       uint64_t Off = sizeof(FileHeader);
       while (Off + sizeof(RecordHeader) <= FileSize) {
         RecordHeader R;
-        memcpy(&R, Data.data() + Off, sizeof(R));
+        memcpy(&R, Map + Off, sizeof(R));
         if (R.Magic != RECORD_MAGIC || R.TotalSize < sizeof(RecordHeader) || R.TotalSize > MAX_RECORD_SIZE || (R.TotalSize & 7) ||
             Off + R.TotalSize > FileSize) {
           break; // torn or foreign tail: everything from here is cut on the next write
@@ -497,12 +488,16 @@ void LoadModule(ModuleCache& M) {
         M.ValidEnd = Off;
       }
     }
+    if (!M.HeaderOk) {
+      MadeiraFexCacheUnmap(Map);
+      Map = nullptr;
+    }
   }
-  Data.resize(M.HeaderOk ? M.ValidEnd : 0);
   const size_t N = Index.size();
   {
     std::unique_lock lk(g_Lock);
-    M.Data.swap(Data);
+    M.Map = Map;
+    M.MapSize = Map ? M.ValidEnd : 0;
     for (auto& [Rip, E] : Index) {
       M.Index.try_emplace(Rip, E);
     }
@@ -513,7 +508,7 @@ void LoadModule(ModuleCache& M) {
   if (Why) {
     LogMan::Msg::EFmt("[fex-cache] ml2400 {} base={:#x}: starting empty ({}) {}", M.Name, M.Base, Why, M.Path);
   } else {
-    LogMan::Msg::EFmt("[fex-cache] ml2400 {} base={:#x}: loaded {} blocks, {} KB indexed in {:.1f} ms{}", M.Name, M.Base, N,
+    LogMan::Msg::EFmt("[fex-cache] ml2400 {} base={:#x}: loaded {} blocks, {} KB mapped and indexed in {:.1f} ms{}", M.Name, M.Base, N,
                       M.ValidEnd / 1024, Ms, M.ValidEnd < FileSize ? " (torn tail ignored)" : "");
   }
 }
@@ -575,14 +570,14 @@ void FlushModule(ModuleCache& M, const char* Why) {
   M.ValidEnd = At + Out.size();
   MadeiraFexCacheSetEnd(M.Writer, M.ValidEnd); // cuts any torn tail left by an earlier crash
   // This session's records become installable too (e.g. after a code buffer clear).
+  // Writes only append after the mapped part, so the view stays valid.
   {
     std::unique_lock lk(g_Lock);
-    if (M.Data.size() < sizeof(FileHeader)) {
-      const FileHeader H = ExpectedHeader(M);
-      M.Data.assign(reinterpret_cast<const uint8_t*>(&H), reinterpret_cast<const uint8_t*>(&H) + sizeof(H));
+    if (M.Tail.empty()) {
+      M.TailStart = At;
     }
-    M.Data.resize(At);
-    M.Data.insert(M.Data.end(), Out.begin(), Out.end());
+    M.Tail.resize(At - M.TailStart);
+    M.Tail.insert(M.Tail.end(), Out.begin(), Out.end());
     for (size_t Off = 0; Off + sizeof(RecordHeader) <= Out.size();) {
       RecordHeader R;
       memcpy(&R, Out.data() + Off, sizeof(R));
@@ -633,11 +628,15 @@ void FlushAll(const char* Why) {
 
 bool ReadRecord(ModuleCache& M, const IndexEntry& E, fextl::vector<uint8_t>& Buf) {
   std::shared_lock lk(g_Lock);
-  if (E.Offset + E.Size > M.Data.size()) {
-    return false;
+  if (E.Offset + E.Size <= M.MapSize) {
+    Buf.assign(M.Map + E.Offset, M.Map + E.Offset + E.Size);
+    return true;
   }
-  Buf.assign(M.Data.begin() + E.Offset, M.Data.begin() + E.Offset + E.Size);
-  return true;
+  if (!M.Tail.empty() && E.Offset >= M.TailStart && E.Offset + E.Size <= M.TailStart + M.Tail.size()) {
+    Buf.assign(M.Tail.begin() + (E.Offset - M.TailStart), M.Tail.begin() + (E.Offset - M.TailStart + E.Size));
+    return true;
+  }
+  return false;
 }
 
 /* The exact instructions Arm64Emitter::LoadConstant emits for a 64-bit DOPAD move,
@@ -1025,6 +1024,19 @@ bool ResolveEnabled(FEXCore::Context::ContextImpl* CTX) {
   return On;
 }
 
+void MaybePrecompile(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread) {
+  static std::atomic<bool> Started {false};
+  if (Started.load(std::memory_order_relaxed)) [[likely]] {
+    return;
+  }
+  const char* E = getenv("MADEIRA_FEX_PRECOMPILE");
+  if (!E || E[0] != '1' || !Enabled(CTX) || Started.exchange(true)) {
+    Started.store(true, std::memory_order_relaxed);
+    return;
+  }
+  MadeiraFexPrecompileRun(Thread);
+}
+
 void DoPendingWork(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread) {
   if (g_Busy.exchange(true, std::memory_order_acquire)) {
     return; // another thread is at it; the flag stays set for whatever it leaves
@@ -1366,6 +1378,22 @@ void Record(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThreadSta
 
 /* Process exit (ARM64EC ProcessTerm / WOW64 BTCpuProcessTerm): write what is
  * pending. Waits briefly for a safe-point worker that is already writing. */
+// Precompile pass: index files of newly seen modules and write what was recorded.
+// Called between compiles, with no FEX lock held.
+extern "C" uint64_t MadeiraFexCodeCacheConfigHash() {
+  return FEXCore::MadeiraCache::g_ConfigHash;
+}
+
+extern "C" void MadeiraFexCodeCacheFlushNow() {
+  using namespace FEXCore::MadeiraCache;
+  if (g_State.load(std::memory_order_acquire) != 1 || g_Busy.exchange(true, std::memory_order_acquire)) {
+    return; // off, or a safe-point worker is at it
+  }
+  LoadRequested();
+  FlushAll("precompile");
+  g_Busy.store(false, std::memory_order_release);
+}
+
 extern "C" void MadeiraFexCodeCacheProcessTerm() {
   using namespace FEXCore::MadeiraCache;
   if (g_State.load(std::memory_order_acquire) != 1) {

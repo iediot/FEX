@@ -143,6 +143,11 @@ inline void SafePoint(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::Interna
   }
 }
 
+// "Preparing game": with MADEIRA_FEX_PRECOMPILE=1 the process's first compile hands
+// over to the frontend, which (once per exe) translates every function its x64 images
+// list in .pdata into the cache before any guest code runs.
+void MaybePrecompile(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread);
+
 // ARM64EC: the frontend and JIT ask RtlIsEcCode while translating; a cached
 // block is only valid while every answer is still the same.
 enum class EcQueryKind : uint64_t { JitExit = 0, FrontendMultiblock = 1 };

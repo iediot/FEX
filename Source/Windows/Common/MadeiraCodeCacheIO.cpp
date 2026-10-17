@@ -101,7 +101,6 @@ void MadeiraFexCacheClose(void* Handle) {
   }
 }
 
-// Creates every missing directory of DosPath ("C:\a\b\c"); existing ones are fine.
 // Lower-case ASCII file name of this process's image ("steam.exe"), or "" if unknown.
 void MadeiraFexCacheProcessName(char* Out, uint32_t Size) {
   Out[0] = 0;
@@ -125,6 +124,30 @@ void MadeiraFexCacheProcessName(char* Out, uint32_t Size) {
   Out[o] = 0;
 }
 
+// Read-only view of a file's first Size bytes: file-backed pages the OS can drop under
+// memory pressure, instead of a heap copy (a precompiled exe's cache runs to hundreds
+// of MB). The view outlives the handle. nullptr on failure.
+const void* MadeiraFexCacheMap(void* Handle, uint64_t Size) {
+  HANDLE Section = nullptr;
+  LARGE_INTEGER Max;
+  Max.QuadPart = static_cast<LONGLONG>(Size);
+  if (!NT_SUCCESS(NtCreateSection(&Section, SECTION_MAP_READ | SECTION_QUERY, nullptr, &Max, PAGE_READONLY, SEC_COMMIT, Handle))) {
+    return nullptr;
+  }
+  void* Base = nullptr;
+  SIZE_T ViewSize = static_cast<SIZE_T>(Size);
+  const NTSTATUS Status = NtMapViewOfSection(Section, NtCurrentProcess(), &Base, 0, 0, nullptr, &ViewSize, ViewUnmap, 0, PAGE_READONLY);
+  NtClose(Section);
+  return NT_SUCCESS(Status) ? Base : nullptr;
+}
+
+void MadeiraFexCacheUnmap(const void* View) {
+  if (View) {
+    NtUnmapViewOfSection(NtCurrentProcess(), const_cast<void*>(View));
+  }
+}
+
+// Creates every missing directory of DosPath ("C:\a\b\c"); existing ones are fine.
 int MadeiraFexCacheMakeDir(const char* DosPath) {
   char Path[1024];
   const size_t Len = strlen(DosPath);
