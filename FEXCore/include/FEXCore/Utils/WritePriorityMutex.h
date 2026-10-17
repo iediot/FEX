@@ -180,7 +180,7 @@ public:
       if (!Sleep) {
         // Acquired early.
         LOGMAN_THROW_A_FMT((Desired & WRITE_OWNED_BIT) != WRITE_OWNED_BIT, "Somehow read-locked and got a write lock!");
-        NoteReadAcquired();
+        NoteReadAcquired(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
         return;
       }
 
@@ -326,7 +326,7 @@ public:
     // Uncontended mutex check
     const bool Acquired = AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
     if (Acquired) {
-      NoteReadAcquired();
+      NoteReadAcquired(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
     }
     return Acquired;
   }
@@ -408,7 +408,8 @@ private:
     if (HolderDumps.fetch_add(1, std::memory_order_relaxed) < 12) {
       for (size_t i = 0; i < 16; i++) {
         if (ReadHolderTeb[i]) {
-          LogMan::Msg::EFmt("[fexlock]   read-holder[{}] teb={:x} tid={:04x}", i, ReadHolderTeb[i], ReadHolderTid[i]);
+          LogMan::Msg::EFmt("[fexlock]   read-holder[{}] teb={:x} tid={:04x} taken-at={:#x} (ml2401)", i, ReadHolderTeb[i],
+                            ReadHolderTid[i], ReadHolderPC[i]);
         }
       }
     }
@@ -504,7 +505,7 @@ private:
         Desired = Expected + READ_OWNER_INCREMENT;
         LOGMAN_THROW_A_FMT((Desired & READ_OWNER_COUNT_MASK) != 0, "Overflow in read-owners!");
         if (AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
-          NoteReadAcquired();
+          NoteReadAcquired(reinterpret_cast<uint64_t>(__builtin_return_address(0)));
           return true;
         }
       }
@@ -657,6 +658,8 @@ private:
    * Slot 9 (0x1700) is the NotifyReadFile flag, slot 10 the wine PUMP beacon. */
   uint64_t ReadHolderTeb[16] {};
   uint32_t ReadHolderTid[16] {};
+  // ml2401: where each read hold was taken (return address of the locking call).
+  uint64_t ReadHolderPC[16] {};
 
   static uint64_t IosSelfTeb() {
     uint64_t Teb = 0;
@@ -666,7 +669,7 @@ private:
     return Teb;
   }
 
-  void NoteReadAcquired() {
+  void NoteReadAcquired(uint64_t PC = 0) {
     const uint64_t Teb = IosSelfTeb();
     if (!Teb) {
       return;
@@ -682,6 +685,7 @@ private:
       uint64_t ExpectedSlot = 0;
       if (std::atomic_ref<uint64_t>(ReadHolderTeb[i]).compare_exchange_strong(ExpectedSlot, Teb, std::memory_order_acq_rel)) {
         ReadHolderTid[i] = *reinterpret_cast<uint32_t*>(Teb + 0x48);
+        ReadHolderPC[i] = PC;
         return;
       }
     }
@@ -707,7 +711,7 @@ private:
 #else
   void NoteWriteAcquired() {}
   void NoteWriteReleased() {}
-  void NoteReadAcquired() {}
+  void NoteReadAcquired(uint64_t = 0) {}
   void NoteReadReleased() {}
   bool IosWriterSelfShared() {
     return false;

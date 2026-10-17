@@ -154,9 +154,12 @@ struct ModuleCache {
   fextl::vector<uint8_t> Pending;
   uint32_t PendingBlocks {};
   bool Full {};
+  // The file's valid bytes, read once at the safe point: installing a block makes
+  // no syscall while compile holds the code invalidation lock (an NtReadFile there
+  // deadlocked Steam's dock against a heap-lock holder waiting to invalidate).
+  fextl::vector<uint8_t> Data;
 
   // Owned by the DoPendingWork / final-flush caller (g_Busy).
-  void* Reader {};
   void* Writer {};
   bool WriterFailed {};
   bool HeaderOk {};
@@ -440,13 +443,34 @@ FileHeader ExpectedHeader(const ModuleCache& M) {
 void LoadModule(ModuleCache& M) {
   const uint64_t T0 = Ticks();
   uint64_t FileSize = 0;
-  M.Reader = MadeiraFexCacheOpen(M.Path.c_str(), 0, &FileSize);
+  void* Reader = MadeiraFexCacheOpen(M.Path.c_str(), 0, &FileSize);
   fextl::robin_map<uint64_t, IndexEntry> Index;
+  fextl::vector<uint8_t> Data;
   const char* Why = "no file";
-  if (M.Reader && FileSize >= sizeof(FileHeader)) {
+  if (Reader && FileSize > g_MaxFileBytes) {
+    Why = "file over MADEIRA_FEX_CODE_CACHE_MAX_MB";
+  } else if (Reader && FileSize >= sizeof(FileHeader)) {
+    Data.resize(FileSize);
+    uint64_t Got = 0;
+    while (Got < FileSize) {
+      const uint32_t Want = static_cast<uint32_t>(std::min<uint64_t>(SCAN_CHUNK, FileSize - Got));
+      const int64_t N = MadeiraFexCacheRead(Reader, Got, Data.data() + Got, Want);
+      if (N <= 0) {
+        break;
+      }
+      Got += static_cast<uint64_t>(N);
+    }
+    FileSize = Got;
+    Data.resize(Got);
+  }
+  if (Reader) {
+    MadeiraFexCacheClose(Reader);
+  }
+  if (FileSize >= sizeof(FileHeader) && Data.size() >= sizeof(FileHeader)) {
     FileHeader H {};
     const FileHeader E = ExpectedHeader(M);
-    if (MadeiraFexCacheRead(M.Reader, 0, &H, sizeof(H)) != sizeof(H) || H.Magic != FILE_MAGIC || H.Version != FILE_VERSION) {
+    memcpy(&H, Data.data(), sizeof(H));
+    if (H.Magic != FILE_MAGIC || H.Version != FILE_VERSION) {
       Why = "bad header";
     } else if (H.ConfigHash != E.ConfigHash) {
       Why = "FEX build or codegen config changed";
@@ -456,21 +480,10 @@ void LoadModule(ModuleCache& M) {
       Why = nullptr;
       M.HeaderOk = true;
       M.ValidEnd = sizeof(FileHeader);
-      fextl::vector<uint8_t> Chunk(SCAN_CHUNK);
-      uint64_t ChunkBase = 0, ChunkLen = 0;
       uint64_t Off = sizeof(FileHeader);
       while (Off + sizeof(RecordHeader) <= FileSize) {
-        if (Off < ChunkBase || Off + sizeof(RecordHeader) > ChunkBase + ChunkLen) {
-          const uint32_t Want = static_cast<uint32_t>(std::min<uint64_t>(SCAN_CHUNK, FileSize - Off));
-          const int64_t Got = MadeiraFexCacheRead(M.Reader, Off, Chunk.data(), Want);
-          if (Got < static_cast<int64_t>(sizeof(RecordHeader))) {
-            break;
-          }
-          ChunkBase = Off;
-          ChunkLen = static_cast<uint64_t>(Got);
-        }
         RecordHeader R;
-        memcpy(&R, Chunk.data() + (Off - ChunkBase), sizeof(R));
+        memcpy(&R, Data.data() + Off, sizeof(R));
         if (R.Magic != RECORD_MAGIC || R.TotalSize < sizeof(RecordHeader) || R.TotalSize > MAX_RECORD_SIZE || (R.TotalSize & 7) ||
             Off + R.TotalSize > FileSize) {
           break; // torn or foreign tail: everything from here is cut on the next write
@@ -481,13 +494,11 @@ void LoadModule(ModuleCache& M) {
       }
     }
   }
-  if (!M.HeaderOk && M.Reader) {
-    MadeiraFexCacheClose(M.Reader);
-    M.Reader = nullptr;
-  }
+  Data.resize(M.HeaderOk ? M.ValidEnd : 0);
   const size_t N = Index.size();
   {
     std::unique_lock lk(g_Lock);
+    M.Data.swap(Data);
     for (auto& [Rip, E] : Index) {
       M.Index.try_emplace(Rip, E);
     }
@@ -559,13 +570,15 @@ void FlushModule(ModuleCache& M, const char* Why) {
   }
   M.ValidEnd = At + Out.size();
   MadeiraFexCacheSetEnd(M.Writer, M.ValidEnd); // cuts any torn tail left by an earlier crash
-  if (!M.Reader) {
-    uint64_t Ignored;
-    M.Reader = MadeiraFexCacheOpen(M.Path.c_str(), 0, &Ignored);
-  }
   // This session's records become installable too (e.g. after a code buffer clear).
-  if (M.Reader) {
+  {
     std::unique_lock lk(g_Lock);
+    if (M.Data.size() < sizeof(FileHeader)) {
+      const FileHeader H = ExpectedHeader(M);
+      M.Data.assign(reinterpret_cast<const uint8_t*>(&H), reinterpret_cast<const uint8_t*>(&H) + sizeof(H));
+    }
+    M.Data.resize(At);
+    M.Data.insert(M.Data.end(), Out.begin(), Out.end());
     for (size_t Off = 0; Off + sizeof(RecordHeader) <= Out.size();) {
       RecordHeader R;
       memcpy(&R, Out.data() + Off, sizeof(R));
@@ -615,11 +628,12 @@ void FlushAll(const char* Why) {
 }
 
 bool ReadRecord(ModuleCache& M, const IndexEntry& E, fextl::vector<uint8_t>& Buf) {
-  if (!M.Reader) {
+  std::shared_lock lk(g_Lock);
+  if (E.Offset + E.Size > M.Data.size()) {
     return false;
   }
-  Buf.resize(E.Size);
-  return MadeiraFexCacheRead(M.Reader, E.Offset, Buf.data(), E.Size) == static_cast<int64_t>(E.Size);
+  Buf.assign(M.Data.begin() + E.Offset, M.Data.begin() + E.Offset + E.Size);
+  return true;
 }
 
 /* The exact instructions Arm64Emitter::LoadConstant emits for a 64-bit DOPAD move,
