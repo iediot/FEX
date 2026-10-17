@@ -102,6 +102,29 @@ void MadeiraFexCacheClose(void* Handle) {
 }
 
 // Creates every missing directory of DosPath ("C:\a\b\c"); existing ones are fine.
+// Lower-case ASCII file name of this process's image ("steam.exe"), or "" if unknown.
+void MadeiraFexCacheProcessName(char* Out, uint32_t Size) {
+  Out[0] = 0;
+  const auto* Params = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters;
+  if (!Params || !Params->ImagePathName.Buffer || !Size) {
+    return;
+  }
+  const WCHAR* Path = Params->ImagePathName.Buffer;
+  const size_t Len = Params->ImagePathName.Length / sizeof(WCHAR);
+  size_t Start = 0;
+  for (size_t i = 0; i < Len; i++) {
+    if (Path[i] == L'\\' || Path[i] == L'/') {
+      Start = i + 1;
+    }
+  }
+  uint32_t o = 0;
+  for (size_t i = Start; i < Len && o + 1 < Size; i++) {
+    const WCHAR C = Path[i];
+    Out[o++] = (C >= L'A' && C <= L'Z') ? char(C - L'A' + 'a') : (C < 0x80 ? char(C) : '?');
+  }
+  Out[o] = 0;
+}
+
 int MadeiraFexCacheMakeDir(const char* DosPath) {
   char Path[1024];
   const size_t Len = strlen(DosPath);

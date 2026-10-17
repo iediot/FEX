@@ -46,6 +46,7 @@ int64_t MadeiraFexCacheWrite(void* Handle, uint64_t Offset, const void* Buffer, 
 int MadeiraFexCacheSetEnd(void* Handle, uint64_t Size);
 void MadeiraFexCacheClose(void* Handle);
 int MadeiraFexCacheMakeDir(const char* DosPath);
+void MadeiraFexCacheProcessName(char* Out, uint32_t Size);
 // ml954 sub-floor windows (ARM64EC IosJitAlias.cpp; WOW64 Module.cpp stubs).
 int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* Size, uint64_t* Real);
 uint64_t IosSubfloorToReal(uint64_t Addr);
@@ -59,7 +60,7 @@ std::atomic<bool> g_WorkPending {false};
 
 namespace {
 constexpr uint32_t FILE_MAGIC = 0x4346464d;   // "MFFC"
-constexpr uint32_t FILE_VERSION = 2; // 2: guest addresses stored relative to the module base
+constexpr uint32_t FILE_VERSION = 3; // 2: guest addresses stored relative to the module base; 3: base-free guest hash
 constexpr uint32_t RECORD_MAGIC = 0x314b4c42; // "BLK1"
 constexpr uint32_t MAX_RECORD_SIZE = 1u << 20;
 constexpr uint64_t MAX_RANGE_SIZE = 1u << 16;
@@ -342,9 +343,12 @@ fextl::string LowerBaseName(const fextl::string& Path) {
 void HashGuestRanges(FEXCore::Context::ContextImpl* CTX, uint64_t GuestRIP, const GuestRange* Ranges, size_t NumRanges, uint64_t Out[2]) {
   XXH3_state_t* S = XXH3_createState();
   XXH3_128bits_reset(S);
-  XXH3_128bits_update(S, &GuestRIP, sizeof(GuestRIP));
+  // Positions relative to the block's RIP, never absolute: the module loads at a new
+  // base most launches, and absolute values rejected every record (Detroit, Oct 17:
+  // guest-bytes=36558 of 37998 after the exe moved 0xc02f20000 -> 0xc02d20000).
   for (size_t i = 0; i < NumRanges; ++i) {
-    XXH3_128bits_update(S, &Ranges[i], sizeof(GuestRange));
+    const uint64_t Rel[2] = {Ranges[i].Start - GuestRIP, Ranges[i].Size};
+    XXH3_128bits_update(S, Rel, sizeof(Rel));
     XXH3_128bits_update(S, reinterpret_cast<const void*>(CTX->GetGuestBase() + Ranges[i].Start), Ranges[i].Size);
   }
   const XXH128_hash_t R = XXH3_128bits_digest(S);
@@ -986,7 +990,21 @@ bool ResolveEnabled(FEXCore::Context::ContextImpl* CTX) {
     return S == 1;
   }
   const char* E = getenv("MADEIRA_FEX_CODE_CACHE");
-  const bool On = E && E[0] == '1';
+  bool On = E && E[0] == '1';
+  // Steam's own processes stay uncached (dockhost.exe is Madeira's dock, which loads
+  // steamclient64.dll): with the cache on, the dock deadlocked at
+  // start (a new thread holding the code lock waited on the process heap, whose
+  // holder waited to invalidate code: stuck on "Loading Steam", Oct 17). The game
+  // is what gains from the cache. MADEIRA_FEX_CODE_CACHE_STEAM=1 includes them.
+  if (On) {
+    char Name[64];
+    MadeiraFexCacheProcessName(Name, sizeof(Name));
+    const char* S = getenv("MADEIRA_FEX_CODE_CACHE_STEAM");
+    if ((!S || S[0] != '1') && (!strncmp(Name, "steam", 5) || !strcmp(Name, "dockhost.exe") || !strcmp(Name, "gameoverlayui.exe"))) {
+      LogMan::Msg::EFmt("[fex-cache] ml2400 off for {} (Steam client process)", Name);
+      On = false;
+    }
+  }
   if (On) {
     const char* Dir = getenv("MADEIRA_FEX_CACHE_DIR");
     g_Dir = (Dir && Dir[0]) ? Dir : "C:\\users\\Public\\madeira-fex-cache";

@@ -408,8 +408,9 @@ private:
     if (HolderDumps.fetch_add(1, std::memory_order_relaxed) < 12) {
       for (size_t i = 0; i < 16; i++) {
         if (ReadHolderTeb[i]) {
-          LogMan::Msg::EFmt("[fexlock]   read-holder[{}] teb={:x} tid={:04x} taken-at={:#x} (ml2401)", i, ReadHolderTeb[i],
-                            ReadHolderTid[i], ReadHolderPC[i]);
+          const auto& St = ReadHolderStack[i];
+          LogMan::Msg::EFmt("[fexlock]   read-holder[{}] teb={:x} tid={:04x} taken-at={:#x} stack={:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x} (ml2402)",
+                            i, ReadHolderTeb[i], ReadHolderTid[i], ReadHolderPC[i], St[0], St[1], St[2], St[3], St[4], St[5], St[6], St[7]);
         }
       }
     }
@@ -658,8 +659,29 @@ private:
    * Slot 9 (0x1700) is the NotifyReadFile flag, slot 10 the wine PUMP beacon. */
   uint64_t ReadHolderTeb[16] {};
   uint32_t ReadHolderTid[16] {};
-  // ml2401: where each read hold was taken (return address of the locking call).
+  // ml2401: where each read hold was taken. ml2402: the return address alone
+  // pointed inside lock_shared, so keep the frame-pointer chain above it.
   uint64_t ReadHolderPC[16] {};
+  static constexpr size_t kHolderFrames = 8;
+  uint64_t ReadHolderStack[16][kHolderFrames] {};
+
+  static void IosCaptureFrames(uint64_t* Out) {
+    auto* FP = static_cast<uint64_t*>(__builtin_frame_address(0));
+    const uint64_t Low = reinterpret_cast<uint64_t>(FP);
+    for (size_t f = 0; f < kHolderFrames; f++) {
+      const uint64_t Addr = reinterpret_cast<uint64_t>(FP);
+      // Frames only move up the stack, by less than 1 MB, and stay 16-byte aligned.
+      if (!FP || (Addr & 0xf) || Addr < Low || Addr - Low > (1u << 20)) {
+        Out[f] = 0;
+        continue;
+      }
+      Out[f] = FP[1];
+      FP = reinterpret_cast<uint64_t*>(FP[0]);
+      if (reinterpret_cast<uint64_t>(FP) <= Addr) {
+        FP = nullptr;
+      }
+    }
+  }
 
   static uint64_t IosSelfTeb() {
     uint64_t Teb = 0;
@@ -686,6 +708,7 @@ private:
       if (std::atomic_ref<uint64_t>(ReadHolderTeb[i]).compare_exchange_strong(ExpectedSlot, Teb, std::memory_order_acq_rel)) {
         ReadHolderTid[i] = *reinterpret_cast<uint32_t*>(Teb + 0x48);
         ReadHolderPC[i] = PC;
+        IosCaptureFrames(ReadHolderStack[i]);
         return;
       }
     }
