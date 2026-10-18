@@ -179,7 +179,15 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
   uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
   fextl::set<uint64_t> VolatileInstructions {};
   FEXCore::IntervalList<uint64_t> VolatileValidRanges {};
-  LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
+  // iOS-Madeira: honour VolatileMetadata=0 (FEX_VOLATILEMETADATA). The option was
+  // only hashed into the code cache key; every image's metadata was applied
+  // regardless, so TSO stayed off for every load the compiler did not list. Source
+  // 2 reads its lock-free job queue's next pointers with plain loads: they ran
+  // unordered and a worker followed a stale NULL (Deadlock, rendersystemdx11.dll).
+  FEX_CONFIG_OPT(UseVolatileMetadata, VOLATILEMETADATA);
+  if (UseVolatileMetadata()) {
+    LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
+  }
   if (auto It = ExtendedMetaData.find(ID); It != ExtendedMetaData.end()) {
     FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
   }

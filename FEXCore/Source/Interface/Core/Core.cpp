@@ -94,30 +94,6 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <utility>
 #include <xxhash.h>
 
-/* iOS-Madeira HOTRIP telemetry — plain globals (no constructors/guard vars).
- * 2026-05-14: per-thread callret tracking (GPT diagnosis: FMOD worker
- * thread leaks callret entries; need to confirm WHICH thread leaks and
- * separate game-thread vs render-thread vs FMOD-worker activity). 4 thread
- * slots hashed by Frame pointer. */
-static volatile uint64_t g_madeira_hot_count[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
-static volatile uint64_t g_madeira_max_alloc_size = 0;
-static volatile uint64_t g_madeira_last_str = 0;
-static volatile uint64_t g_madeira_last_vt = 0;
-static volatile uint64_t g_madeira_last_vt2 = 0;
-static volatile uint64_t g_madeira_callret_max = 0;
-static volatile uint64_t g_madeira_callret_min = ~(uint64_t)0;
-static volatile uint64_t g_madeira_callret_last = 0;
-
-/* Per-thread tracking (4 slots). Key = Frame ptr (unique per FEX thread).
- * Records callret_sp range, block-dispatch count, and last guest RIP seen
- * to localize WHICH thread is leaking callret entries. */
-static volatile uint64_t g_madeira_thr_key[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_crsp_min[4] = {~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0};
-static volatile uint64_t g_madeira_thr_crsp_max[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_crsp_last[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
-static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
-
 /* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
 static volatile uint64_t g_cb_real_compiles = 0;
@@ -658,12 +634,9 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
   Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this, Thread);
   Thread->OpDispatcher->SetMultiblock(Config.Multiblock);
-  LogMan::Msg::EFmt("[TI-IC] lookupcache");
   Thread->LookupCache = fextl::make_unique<FEXCore::LookupCache>(this);
-  LogMan::Msg::EFmt("[TI-IC] decoder");
   Thread->FrontendDecoder = fextl::make_unique<FEXCore::Frontend::Decoder>(Thread);
   Thread->PassManager = fextl::make_unique<FEXCore::IR::PassManager>();
-  LogMan::Msg::EFmt("[TI-IC] passmanager");
 
   Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
   Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
@@ -679,16 +652,13 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
 
   // Create CPU backend
   Thread->PassManager->InsertRegisterAllocationPass(this);
-  LogMan::Msg::EFmt("[TI-IC] jitcore");
   Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
-  LogMan::Msg::EFmt("[TI-IC] jitcore-done");
 
   Thread->PassManager->Finalize();
 }
 
 FEXCore::Core::InternalThreadState*
 ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXCore::Core::CPUState* NewThreadState) {
-  LogMan::Msg::EFmt("[TI-IC] createthread-enter");
 
   /* ml790: ALLOCATE, CHECK, THEN CONSTRUCT.
    *
@@ -738,7 +708,6 @@ ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXC
   FEXCore::Core::InternalThreadState* Thread = ::new (ThreadMem) FEXCore::Core::InternalThreadState {
     .CTX = this,
   };
-  LogMan::Msg::EFmt("[TI-IC] threadstate-alloc");
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
   Thread->CurrentFrame->State.gregs[X86State::REG_RSP] = StackPointer;
@@ -2058,47 +2027,20 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * Going forward: log occurrences so we can see when host PCs leak into
    * State.rip, but do NOT mutate state. The real fix belongs in the
    * dispatcher's EnterEC path. */
-  {
-    /* JIT pool observed at RX=0x11cc00000+0x10000000 across runs. Tighten
-     * the detector to the actual pool range so we don't false-positive on
-     * other 0x1XXXXXXXX guest addresses. ASLR jitter is ~16MB so widen by
-     * 32MB on each side. */
-    constexpr uint64_t pool_lo = 0x11c000000ULL;
-    constexpr uint64_t pool_hi = 0x12e000000ULL;
-    if (GuestRIP >= pool_lo && GuestRIP < pool_hi) {
-      uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
-      static volatile uint32_t jit_rip_dump_count = 0;
-      uint32_t dn = __sync_add_and_fetch(&jit_rip_dump_count, 1);
-      if (dn <= 8) {
-        LogMan::Msg::EFmt("[JITPOOL_RIP #{}] GuestRIP=0x{:x} (HOST PC LEAKED INTO STATE.RIP)  "
-                          "State.rip=0x{:x} callret_sp=0x{:x} Frame=0x{:x}  "
-                          "pool=0x{:x}..0x{:x}",
-                          dn, GuestRIP,
-                          Frame ? Frame->State.rip : 0, crsp,
-                          reinterpret_cast<uintptr_t>(Frame),
-                          pool_lo, pool_hi);
-        if (crsp != 0 && crsp >= 0x10000) {
-          for (int i = 0; i < 8; i++) {
-            uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
-            LogMan::Msg::EFmt("[JITPOOL_RIP #{}]   callret[+0x{:x}] = {{pc=0x{:x}, ret=0x{:x}}}",
-                              dn, i * 0x10, pair[0], pair[1]);
-          }
-        }
-      }
-      /* Log-only — no state mutation. Fall through to normal compile path.
-       * If FEX subsequently faults trying to decode the JIT pool bytes as
-       * x86, we'll see that in the Mach handler — at least we know the
-       * exact RIP that leaked. */
-    }
-  }
-
   /* iOS-Madeira 2026-05-18 low-noise summary. Replaces per-call log (which
    * was producing ~180K lines/run for hot RIP 0x140028d46 alone, each
    * amplified ~6× by Wine's file trace). Counters: g_cb_total bumped
    * every CompileBlock call; g_cb_real_compiles bumped after cache miss
    * proves we actually compile (see below at LookupCache fallthrough).
    * Boyer-Moore-style 1-slot hot-RIP estimator. Summary every 16K calls. */
-  {
+  /* Opt-in since the audit: two shared atomics per call across all threads.
+   * MADEIRA_FEX_CB_SUMMARY=1 restores the [CB_SUMMARY] lines. */
+  static int CbSummaryOn = -1;
+  if (CbSummaryOn < 0) {
+    const char* E = getenv("MADEIRA_FEX_CB_SUMMARY");
+    CbSummaryOn = (E && E[0] == '1') ? 1 : 0;
+  }
+  if (CbSummaryOn) {
     static volatile uint64_t g_cb_last_summary_total = 0;
     static volatile uint64_t g_cb_hot_rip = 0;
     static volatile uint64_t g_cb_hot_rip_count = 0;
@@ -2163,130 +2105,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Madeira 2026-05-14: per-thread callret tracking (runs for EVERY
-   * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
-   * pointer (unique per FEX thread). Identifies WHICH thread is leaking
-   * callret entries vs healthy. */
-  {
-    uintptr_t fk = reinterpret_cast<uintptr_t>(Frame);
-    int slot = (int)((fk >> 6) & 3);
-    /* Claim the slot if empty, or use if matches; ignore on collision. */
-    if (g_madeira_thr_key[slot] == 0 || g_madeira_thr_key[slot] == fk) {
-      g_madeira_thr_key[slot] = fk;
-      uint64_t crsp = Frame->State.callret_sp;
-      g_madeira_thr_crsp_last[slot] = crsp;
-      g_madeira_thr_last_rip[slot] = GuestRIP;
-      g_madeira_thr_count[slot]++;
-      if (crsp != 0) {
-        if (crsp < g_madeira_thr_crsp_min[slot]) g_madeira_thr_crsp_min[slot] = crsp;
-        if (crsp > g_madeira_thr_crsp_max[slot]) g_madeira_thr_crsp_max[slot] = crsp;
-      }
-    }
-  }
-
-  /* iOS-Madeira 2026-05-13 lightweight HOTRIP instrumentation (v3): use
-   * plain volatile globals to avoid __cxa_guard_acquire on static-local
-   * initialization, which appears to trip a stack-cookie check on
-   * ARM64EC mingw. POD types only — no constructors. Atomicity isn't
-   * critical for telemetry; occasional torn reads are fine. */
-  {
-    /* RIPs depend on FMOD's mapped base (0xeaa1d0000 in current runs).
-     * The two critsection wrappers GPT identified live at fmod+0xba27a
-     * and fmod+0xba2fa. Match on the FMOD-relative range rather than
-     * absolute address so this works across ASLR runs. */
-    int idx = -1;
-    uint64_t fmod_off = GuestRIP - 0xeaa1d0000ull;
-    switch (GuestRIP) {
-      case 0x140006fe6ull: idx = 0; break;
-      case 0x140006febull: idx = 1; break;
-      case 0x140028d20ull: idx = 2; break;
-      case 0x140028d41ull: idx = 3; break;
-      case 0x140028d46ull: idx = 4; break;
-      case 0x1400687f0ull: idx = 5; break;
-      case 0x140068816ull: idx = 6; break;
-      default:
-        /* FMOD critsection wrappers — relative to current fmod64 base. */
-        if (GuestRIP == 0xeaa28a27aull) idx = 7;       /* EnterCriticalSection wrapper */
-        else if (GuestRIP == 0xeaa28a2faull) idx = 8;  /* LeaveCriticalSection wrapper */
-        else if (GuestRIP == 0xeaa28a9d4ull) idx = 9;  /* GPT-mentioned wrapper */
-        else if (GuestRIP == 0xeaa28a9e3ull) idx = 10; /* GPT-mentioned wrapper */
-        else if (fmod_off >= 0xba000 && fmod_off < 0xbb000) idx = 11; /* any other near these */
-        break;
-    }
-    if (idx >= 0) {
-      uint64_t n = ++g_madeira_hot_count[idx];
-
-      /* Track callret_sp range — answers "leak (monotonic) vs boundary (oscillating)". */
-      uint64_t crsp = Frame->State.callret_sp;
-      g_madeira_callret_last = crsp;
-      if (crsp > g_madeira_callret_max) g_madeira_callret_max = crsp;
-      if (crsp != 0 && crsp < g_madeira_callret_min) g_madeira_callret_min = crsp;
-
-      if (idx == 5 || idx == 6) {
-        uint64_t sz = Frame->State.gregs[FEXCore::X86State::REG_RDI];
-        if (sz > g_madeira_max_alloc_size) g_madeira_max_alloc_size = sz;
-      }
-
-      if (idx == 1) {
-        uint64_t rbx = Frame->State.gregs[FEXCore::X86State::REG_RBX];
-        uint64_t rcx = Frame->State.gregs[FEXCore::X86State::REG_RCX];
-        if (rbx >= 0x10000ull && rbx < 0x800000000000ull) {
-          uint64_t rbx_0 = *reinterpret_cast<uint64_t*>(rbx);
-          if (rbx_0 >= 0x10000ull && rbx_0 < 0x800000000000ull) {
-            uint64_t vt = *reinterpret_cast<uint64_t*>(rbx_0);
-            if (vt >= 0x10000ull && vt < 0x800000000000ull) {
-              g_madeira_last_vt = vt;
-              g_madeira_last_vt2 = *reinterpret_cast<uint64_t*>(vt + 0x10);
-            }
-          }
-        }
-        if (rcx >= 0x10000ull && rcx < 0x800000000000ull) {
-          uint64_t bytes = *reinterpret_cast<uint64_t*>(rcx);
-          uint8_t b0 = bytes & 0xff;
-          if (b0 >= 0x20 && b0 <= 0x7e) g_madeira_last_str = bytes;
-        }
-      }
-
-      if ((n & 0xFFF) == 0) {
-        /* Wall-clock elapsed since first HOT sum — answers "is the game
-         * still alive at minute N?" Uses time(NULL) for second resolution. */
-        static volatile uint64_t s_start_secs = 0;
-        uint64_t now = (uint64_t)time(NULL);
-        if (s_start_secs == 0) s_start_secs = now;
-        uint64_t elapsed = now - s_start_secs;
-        LogMan::Msg::EFmt("[HOT sum t={}s] 6fe6={} 6feb={} 28d20={} 28d41={} 28d46={} 687f0={} 68816={} "
-                           "fmod27a={} fmod2fa={} fmod9d4={} fmod9e3={} fmodNear={} "
-                           "max_alloc=0x{:x} crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "
-                           "last_vt=0x{:x} vt2=0x{:x} last_str=0x{:x}",
-                           elapsed,
-                           g_madeira_hot_count[0], g_madeira_hot_count[1], g_madeira_hot_count[2],
-                           g_madeira_hot_count[3], g_madeira_hot_count[4], g_madeira_hot_count[5],
-                           g_madeira_hot_count[6],
-                           g_madeira_hot_count[7], g_madeira_hot_count[8],
-                           g_madeira_hot_count[9], g_madeira_hot_count[10], g_madeira_hot_count[11],
-                           g_madeira_max_alloc_size,
-                           g_madeira_callret_min, g_madeira_callret_last, g_madeira_callret_max,
-                           g_madeira_last_vt, g_madeira_last_vt2, g_madeira_last_str);
-        /* Per-thread breakdown — dump all 4 slots so we can see which
-         * thread is leaking callret entries. Distance min→last is the
-         * "depth below high-water" — for the leaking thread this grows. */
-        for (int s = 0; s < 4; s++) {
-          if (g_madeira_thr_key[s] == 0) continue;
-          uint64_t mn = g_madeira_thr_crsp_min[s];
-          uint64_t la = g_madeira_thr_crsp_last[s];
-          uint64_t mx = g_madeira_thr_crsp_max[s];
-          uint64_t span = (la <= mx) ? (mx - la) : 0;
-          LogMan::Msg::EFmt("[HOT thr{} t={}s] frame=0x{:x} blocks={} "
-                             "crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "
-                             "leak_depth=0x{:x} last_rip=0x{:x}",
-                             s, elapsed, g_madeira_thr_key[s],
-                             g_madeira_thr_count[s], mn, la, mx, span,
-                             g_madeira_thr_last_rip[s]);
-        }
-      }
-    }
-  }
-
+  /* iOS-Madeira (audit 2026-10-18): the per-thread callret tracker and the Thumper/FMOD
+   * hot-RIP probe that stood here ran on EVERY CompileBlock call for every game: shared
+   * counters written by all threads, and at seven hard-coded RIPs under 0x140000000 (the
+   * default x64 exe base, so any game) it dereferenced guest registers -- RBX, *RBX, a
+   * vtable -- without checks. Removed; the ml2110 [lookup-stats] switch covers the
+   * per-thread view when needed. */
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
 #ifdef FEX_IOS_HOST

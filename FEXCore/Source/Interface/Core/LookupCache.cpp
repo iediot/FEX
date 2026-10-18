@@ -84,9 +84,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
      * on iOS — pages stay faulting after VirtualAlloc(MEM_COMMIT) returns.
      * Pre-commit the whole region; physical pages are still demand-faulted
      * by the kernel. */
-    LogMan::Msg::EFmt("[TI-IC] lookupcache-alloc size=0x{:x}", TotalCacheSize);
     AllocationBase = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, true));
-    LogMan::Msg::EFmt("[TI-IC] lookupcache-alloc -> 0x{:x}", AllocationBase);
 #else
     AllocationBase = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
 #endif
@@ -147,7 +145,9 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
    * counts double as the probe for whether the hazard still exists at all. */
   size_t StaleL2 = L2Enabled ? FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(PageMemory), L2TableSize) : 0;
   size_t StaleL1 = FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
-  LogMan::Msg::EFmt("[TI-IC] zero-scrub rev=ml606 l2-stale=0x{:x} l1-stale=0x{:x}", StaleL2, StaleL1);
+  if (StaleL2 || StaleL1) {
+    LogMan::Msg::EFmt("[TI-IC] zero-scrub rev=ml606 l2-stale=0x{:x} l1-stale=0x{:x}", StaleL2, StaleL1);
+  }
 #endif
 }
 

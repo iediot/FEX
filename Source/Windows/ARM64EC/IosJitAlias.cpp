@@ -113,7 +113,20 @@ void CacheAdd(IosAliasCacheEntry* Cache, uint64_t Base, uint64_t Size, uint64_t 
   }
 }
 
+/* iOS-Madeira: the span of every pool copy ever registered. CompileBlock asks
+ * IosJitReverseTranslate about every guest RIP it is handed, and for ordinary x64
+ * code (the usual case) the answer is "no alias": the hit cache never holds that,
+ * so each call walked the whole table (one entry per image ever mapped, retired
+ * slots included). Pool copies all live inside the JIT pool, so an address outside
+ * [lo, hi) cannot be one. Only ever widened: a stale span costs a walk, never a
+ * wrong answer. Written under UpdateLock. */
+uint64_t g_JitSpanLo = ~0ull, g_JitSpanHi = 0;
+
 void EntryPublish(IosAliasEntry& Entry, uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
+  if (Size) {
+    if (JitBase < __atomic_load_n(&g_JitSpanLo, __ATOMIC_RELAXED)) __atomic_store_n(&g_JitSpanLo, JitBase, __ATOMIC_RELEASE);
+    if (JitBase + Size > __atomic_load_n(&g_JitSpanHi, __ATOMIC_RELAXED)) __atomic_store_n(&g_JitSpanHi, JitBase + Size, __ATOMIC_RELEASE);
+  }
   const uint64_t Old = __atomic_load_n(&Entry.Generation, __ATOMIC_RELAXED);
   __atomic_store_n(&Entry.Generation, Old | 1, __ATOMIC_RELEASE);
   Entry.PeBase = PeBase;
@@ -541,6 +554,9 @@ uint64_t IosJitTranslate(uint64_t Addr) {
 uint64_t IosJitReverseTranslate(uint64_t Addr) {
   uint64_t Result;
   if (CacheRead(IosAliasJitCache, Addr, Result)) return Result;
+  if (Addr < __atomic_load_n(&g_JitSpanLo, __ATOMIC_ACQUIRE) || Addr >= __atomic_load_n(&g_JitSpanHi, __ATOMIC_ACQUIRE)) {
+    return Addr;
+  }
   const int count = __atomic_load_n(&g_EntryCount, __ATOMIC_ACQUIRE);
   for (int i = count - 1; i >= 0; --i) {
     uint64_t pb, jb, sz;

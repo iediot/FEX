@@ -1958,53 +1958,10 @@ extern "C" uint32_t BTCpu64IosReleaseThreadHolds(void* TebPtr, uint64_t* OutStam
   return Result;
 }
 
-#ifdef FEX_IOS_HOST
-/* iOS-Madeira: step markers through ThreadInit. Two runs have died with a
- * fresh post-detach thread's "ThreadInit() entered" as the last FEX log
- * line (silent kill, no crash report) — once during loading's worker-thread
- * spawn, once when QuickTime's recording start triggered a thread spawn.
- * These markers bisect which init step dies (CreateThread's per-thread
- * CodeBuffer/LookupCache allocation is the prime suspect). */
-static void IosTiLog(const char* msg) {
-  HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
-      ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
-            NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
-      : nullptr;
-  if (stderr_h) {
-    ULONG written = 0;
-    size_t len = 0;
-    while (msg[len]) len++;
-    WriteFile(stderr_h, msg, static_cast<DWORD>(len), &written, nullptr);
-  }
-}
-#endif
 
 NTSTATUS ThreadInit() {
-#ifdef FEX_IOS_HOST
-  /* iOS-Madeira diagnostic: log entry to thread-init so we can confirm Wine
-   * is calling BTCpu64ThreadInit for the main x86_64 thread before the
-   * dispatcher is invoked. Without this, EmulatorData[0] is garbage and
-   * the dispatcher BLR's into uninitialized memory. */
-  {
-    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
-        ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
-              NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
-        : nullptr;
-    if (stderr_h) {
-      const char *msg = "[FEX-iOS] ThreadInit() entered\n";
-      ULONG written = 0;
-      WriteFile(stderr_h, msg, 32, &written, nullptr);
-    }
-  }
-#endif
   std::scoped_lock Lock(ThreadCreationMutex);
-#ifdef FEX_IOS_HOST
-  IosTiLog("[FEX-iOS] TI:lock\n");
-#endif
   FEX::Windows::InitCRTThread();
-#ifdef FEX_IOS_HOST
-  IosTiLog("[FEX-iOS] TI:crt\n");
-#endif
   const auto CPUArea = GetCPUArea();
 
   static constexpr size_t EmulatorStackSize = 0x40000;
@@ -2012,9 +1969,6 @@ NTSTATUS ThreadInit() {
     reinterpret_cast<uint64_t>(::VirtualAlloc(nullptr, EmulatorStackSize, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE));
   CPUArea.EmulatorStackLimit() = EmulatorStack;
   CPUArea.EmulatorStackBase() = EmulatorStack + EmulatorStackSize;
-#ifdef FEX_IOS_HOST
-  IosTiLog("[FEX-iOS] TI:stack\n");
-#endif
 
   auto* Thread = CTX->CreateThread(0, 0);
   if (!Thread) {
@@ -2033,9 +1987,6 @@ NTSTATUS ThreadInit() {
     FEX::Windows::DeinitCRTThread();
     return STATUS_NO_MEMORY;
   }
-#ifdef FEX_IOS_HOST
-  IosTiLog("[FEX-iOS] TI:createthread\n");
-#endif
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;
@@ -2119,211 +2070,16 @@ NTSTATUS ThreadInit() {
     FEX::Windows::DeinitCRTThread();
     return STATUS_NO_MEMORY;
   }
-#ifdef FEX_IOS_HOST
-  IosTiLog("[FEX-iOS] TI:callret\n");
-#endif
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
   CPUArea.DispatcherLoopTopEnterEC() = EnterEC;
 
-#ifdef FEX_IOS_HOST
-  /* iOS-Madeira: PATCH FEX dispatcher's broken SpillStaticRegs.
-   *
-   * FEX's emitter on iOS produces 7 stale `madd`/`mul` instructions where
-   * 7 `stp` should be (pairs 1-7: RDX/RBX, RSP/RBP, RSI/RDI, R8/R9, R10/R11,
-   * R12/R13, R14/R15). Same bug at BOTH SpillStaticRegs sites in the
-   * dispatcher (ExitFunctionLink at +0x164, NoBlock at +0x264). Net effect:
-   * State.gregs[REG_RSP] never spilled before CompileBlock; FillStaticRegs
-   * later reloads x23=0 and block 0's first `stp x26, x25, [x23, #-0x10]!`
-   * faults at 0xfffffffffffffff0.
-   *
-   * Workaround: write the correct stp encodings over the broken slots at
-   * BOTH sites. The writes go to the RX address; iOS denies RW on RX pages
-   * but the ntdll-unix Mach STR emulator catches each fault and redirects
-   * the store to the JIT pool's RW alias (located at a runtime-chosen
-   * address, NOT a fixed offset from RX).                                   */
-  {
-    /* Expected stp instructions for pairs 1..7 of SpillStaticRegs.
-     * ARM64EC SRA: RAX=x8 (pair0=RAX,RCX), RDX=x1, RBX=x27 (pair1),
-     * RSP=x23, RBP=x29 (pair2), RSI=x25, RDI=x26 (pair3),
-     * R8=x2, R9=x3 (pair4), R10=x4, R11=x5 (pair5),
-     * R12=x19, R13=x20 (pair6), R14=x21, R15=x22 (pair7). */
-    static constexpr uint32_t expected[7] = {
-      0xa9036f81,  // stp x1, x27, [x28, #0x30]
-      0xa9047797,  // stp x23, x29, [x28, #0x40]
-      0xa9056b99,  // stp x25, x26, [x28, #0x50]
-      0xa9060f82,  // stp x2, x3, [x28, #0x60]
-      0xa9071784,  // stp x4, x5, [x28, #0x70]
-      0xa9085393,  // stp x19, x20, [x28, #0x80]
-      0xa9095b95,  // stp x21, x22, [x28, #0x90]
-    };
-
-    /* Two SpillStaticRegs sites in the dispatcher emit, with DIFFERENT
-     * shapes:
-     *  - First site (ExitFunctionLink path) at EnterEC+0x160: emitter places
-     *    pair-0 at +0x160, then a SPURIOUS invalid word at +0x164, then
-     *    pair-1..pair-7 at +0x168..+0x180. Net 9 instructions for 8 spills.
-     *  - Second site (NoBlock path) at EnterEC+0x264: emitter places pair-0
-     *    at +0x264 (legit, no spurious), then pair-1..pair-7 at +0x268..+0x280.
-     *
-     * Fix: at the FIRST site, shift pair-1..pair-7 LEFT by 4 bytes so they
-     * land at +0x164..+0x17C — overwriting the spurious slot, with NOP at
-     * +0x180 (was the displaced pair-7). The dispatcher then executes 8 stp
-     * pairs at consecutive offsets +0x160..+0x17C, falls through the NOP at
-     * +0x180, and resumes at the existing FP-save base setup at +0x184. At
-     * the SECOND site, layout is already correct: pair-0 stays at +0x264,
-     * pair-1..pair-7 patched at +0x268..+0x280 as before. */
-    struct PatchSite {
-      uintptr_t pair1_offset;   // where pair-1 should land
-      bool      nop_after_pair7; // need a NOP just past pair-7?
-    };
-    static constexpr PatchSite kSites[] = {
-      // 2026-05-19: The hardcoded {0x164, true} site has been removed.
-      // With the per-Buffer dual-map fix in place, FEX's dispatcher emit
-      // now produces correct stp instructions at +0x164 directly (GPT
-      // diagnosed: pair0 at +0x158, pair1 at +0x15c, pair2 at +0x160 —
-      // valid code, not the broken pattern). The hardcoded patch was
-      // OVERWRITING valid code with stp's that didn't belong there,
-      // corrupting the dispatcher layout and causing st1 faults later.
-      //
-      // The generic uniformity-based scanner below correctly handles the
-      // REAL broken sites (where pair-0 stp is followed by 7 uniform-class
-      // garbage words). If the scanner reports 0 patched, the dispatcher
-      // came out correct.
-      // All other sites are scanned/patched dynamically below — the FEX
-      // emitter produces the same broken 7-word pattern at MANY offsets
-      // (24+ sites in Thumper, growing with each new code path). Iterating
-      // a hardcoded list was whack-a-mole; we now scan the whole dispatcher
-      // region for `stp x8,x0,[x28,#0x20]` immediately followed by the
-      // canonical 7-invalid-words sequence, and rewrite them in-place.
-    };
-
-    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
-        ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
-              NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
-        : nullptr;
-    auto log_hex = [&](const char* label, uint64_t val) {
-      if (!stderr_h) return;
-      char buf[160];
-      const char* hexd = "0123456789abcdef";
-      int n = 0;
-      while (label[n]) { buf[n] = label[n]; n++; }
-      buf[n++] = '0'; buf[n++] = 'x';
-      for (int j = 60; j >= 0; j -= 4) buf[n++] = hexd[(val >> j) & 0xf];
-      buf[n++] = '\n';
-      ULONG written = 0;
-      WriteFile(stderr_h, buf, n, &written, nullptr);
-    };
-
-    log_hex("[FEX-iOS] DispatcherPatch: EnterEC=", EnterEC);
-
-    static constexpr uint32_t kNopInstr = 0xd503201f;  // nop
-
-    for (auto site : kSites) {
-      /* Write directly to RX address. iOS doesn't allow RX writes — but the
-       * ntdll-unix Mach STR emulator catches the resulting page fault and
-       * redirects each store to the correct RW alias (which iOS placed at
-       * a runtime-chosen address, NOT a fixed +128MB offset). This is the
-       * same path FEX itself uses for its compile-time block emit. */
-      uint32_t* patch_rx = reinterpret_cast<uint32_t*>(EnterEC + site.pair1_offset);
-
-      bool already_ok = true;
-      for (int i = 0; i < 7; i++) {
-        if (patch_rx[i] != expected[i]) { already_ok = false; break; }
-      }
-      if (already_ok && site.nop_after_pair7 && patch_rx[7] != kNopInstr) {
-        already_ok = false;
-      }
-
-      if (!already_ok) {
-        log_hex("[FEX-iOS]   site pair-1 offset=", site.pair1_offset);
-        /* Write to RW alias directly. The iOS JIT pool is dual-mapped:
-         * RX at the runtime-chosen base, RW at RX + 256MB. Writing to RX
-         * triggers a Mach exception that our STR emulator handles, but
-         * empirically that path has been silently dropping a specific store
-         * per site (e.g. pair-5) without faulting — possibly an iOS
-         * page-protection quirk where ThreadInit's STRs to RX from xtajit64.dll
-         * neither succeed natively nor trap.
-         *
-         * Bypass entirely by writing to the RW alias. RX→RW offset comes
-         * from DualMap::WriteOffset (set in ProcessInit from the app's real
-         * runtime mapping) — NOT a hardcoded 0x10000000, since the RW alias
-         * is placed with VM_FLAGS_ANYWHERE and isn't guaranteed to sit at
-         * RX+256MB. */
-        const int64_t kRwOffset = FEXCore::DualMap::WriteOffset;
-        uint32_t* patch_rw = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(patch_rx) + kRwOffset);
-        for (int i = 0; i < 7; i++) {
-          patch_rw[i] = expected[i];
-        }
-        size_t flush_size = sizeof(expected);
-        if (site.nop_after_pair7) {
-          patch_rw[7] = kNopInstr;
-          flush_size += sizeof(kNopInstr);
-        }
-        NtFlushInstructionCache(NtCurrentProcess(), patch_rx, flush_size);
-      } else {
-        log_hex("[FEX-iOS]   already OK at pair-1 offset=", site.pair1_offset);
-      }
-    }
-
-    /* Generic scan: many SpillStaticRegs sites in the dispatcher exhibit the
-     * same broken-pattern (pair-0 stp at offset N, then 7 invalid words at
-     * N+4..N+0x1c). Rather than hardcoding each offset, walk the dispatcher
-     * region and rewrite every occurrence in-place. The 7-word signature is
-     * specific enough that there are no false positives in the FEX
-     * dispatcher (the canonical broken first-word `0x1ccfef95` doesn't
-     * decode to anything used in normal emit). */
-    {
-      static constexpr size_t kScanBytes = 0x2000;
-      static constexpr uint32_t kStpPair0 = 0xa9020388;  /* stp x8,x0,[x28,#0x20] */
-      /* Detect broken sites by UNIFORMITY: the FEX emitter's bug produces 7
-       * garbage instructions where pair-1..pair-7 stps should go. The exact
-       * encoding class varies per build (FCSEL 0x1c..0x1d, MADD/MSUB
-       * 0x1a..0x1b, observed) but within a single broken site, all 7 garbage
-       * words share the same top encoding-class byte (`& 0xff800000`).
-       *
-       * Real dispatcher code that follows a legitimate pair-0 stp varies:
-       * arithmetic, branches, loads, calls — DIFFERENT top bytes. So
-       * "uniform top byte across 7 words AND not 0xa9 (stp)" is a tight
-       * discriminator that catches every observed garbage class without
-       * false-positiving on real code.
-       *
-       * (Earlier negative-match-on-stp filter false-positived: legitimate
-       * pair-0 sites whose follow-up code has 7 non-stp instructions got
-       * their tails overwritten with pair-1..pair-7, breaking valid code.) */
-      static constexpr uint32_t kStpMask = 0xff800000;
-      static constexpr uint32_t kStp64SignedOffset = 0xa9000000;
-      uint32_t* base = reinterpret_cast<uint32_t*>(EnterEC);
-      int patched = 0;
-      int already_ok = 0;
-      for (size_t i = 0; i < kScanBytes / 4 - 8; i++) {
-        if (base[i] != kStpPair0) continue;
-        uint32_t top0 = base[i + 1] & kStpMask;
-        if (top0 == kStp64SignedOffset) { already_ok++; continue; }
-        bool uniform = true;
-        for (int j = 2; j <= 7; j++) {
-          if ((base[i + j] & kStpMask) != top0) { uniform = false; break; }
-        }
-        if (!uniform) continue;  /* legit code following pair-0 — leave alone */
-        /* Write to RW alias via the real runtime offset (DualMap::WriteOffset),
-         * not a hardcoded 0x10000000. See the other patch site for rationale. */
-        const int64_t kRwOffset = FEXCore::DualMap::WriteOffset;
-        uint32_t* rw_base = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(&base[i + 1]) + kRwOffset);
-        for (int j = 0; j < 7; j++) {
-          rw_base[j] = expected[j];
-        }
-        NtFlushInstructionCache(NtCurrentProcess(), &base[i + 1], sizeof(expected));
-        patched++;
-      }
-      log_hex("[FEX-iOS]   scan-patched broken sites: count=", (uint64_t)patched);
-      log_hex("[FEX-iOS]   scan-skipped already-ok pair-0 sites: count=", (uint64_t)already_ok);
-    }
-
-    log_hex("[FEX-iOS] DispatcherPatch DONE.", 0);
-  }
-#endif
+  /* iOS-Madeira (audit 2026-10-18): a per-thread scan-and-patch of 8 KB of EnterEC
+   * for a long-fixed emitter fault (stp pairs 1..7) stood here. Every run logged
+   * "scan-patched broken sites: count=0", and it rewrote shared dispatcher code
+   * while other threads ran it. Removed. */
 
   uint64_t EnterECFillSRA = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterECFillSRA;
   CPUArea.DispatcherLoopTopEnterECFillSRA() = EnterECFillSRA;
@@ -2360,34 +2116,6 @@ NTSTATUS ThreadInit() {
   CPUArea.Area->SuspendDoorbell = reinterpret_cast<ULONG*>(&Thread->CurrentFrame->SuspendDoorbell);
 #ifdef FEX_IOS_HOST
   IosLogCPUArea("ThreadInit-done");
-#endif
-#ifdef FEX_IOS_HOST
-  {
-    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
-        ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
-              NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
-        : nullptr;
-    if (stderr_h) {
-      char buf[256];
-      const char *hexd = "0123456789abcdef";
-      const char *prefix = "[FEX-iOS] ThreadInit() done: EmulatorData[0]=0x";
-      int i = 0;
-      while (prefix[i]) { buf[i] = prefix[i]; i++; }
-      unsigned long long ed0 = (unsigned long long)CPUArea.Area->EmulatorData[0];
-      for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(ed0 >> j) & 0xf];
-      const char *p2 = " EnterEC=0x";
-      for (int k = 0; p2[k]; ++k) buf[i++] = p2[k];
-      unsigned long long enter_ec = (unsigned long long)CPUArea.DispatcherLoopTopEnterEC();
-      for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(enter_ec >> j) & 0xf];
-      const char *p3 = " gs_cached=0x";
-      for (int k = 0; p3[k]; ++k) buf[i++] = p3[k];
-      unsigned long long gs = (unsigned long long)Frame->State.gs_cached;
-      for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(gs >> j) & 0xf];
-      buf[i++] = '\n';
-      ULONG written = 0;
-      WriteFile(stderr_h, buf, i, &written, nullptr);
-    }
-  }
 #endif
   return STATUS_SUCCESS;
 }

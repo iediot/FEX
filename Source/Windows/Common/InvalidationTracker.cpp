@@ -166,8 +166,13 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
                           ProtInterval.End, AlignedSize >> 20, Prot);
         return false;
       }
-      LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                        ProtInterval.Offset, ProtInterval.End);
+      {
+        static std::atomic<uint32_t> XremProtLogs {0};
+        if (XremProtLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
+          LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x}", static_cast<void*>(this), ProtInterval.Offset,
+                            ProtInterval.End);
+        }
+      }
       XIntervals.Remove(ProtInterval);
       RWXIntervals.Remove(ProtInterval);
       if (DEPDisabled) {
@@ -277,8 +282,12 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
        * its own xtajit64 copy and its own tracker) and pair it with the query-side log in
        * QueryGuestExecutableRange. If the insert and the failing query name different
        * `this`, the registration is landing in a different process's tracker. */
-      LogMan::Msg::EFmt("[iOS-xins] tracker={} {} sec={:#x}-{:#x}", static_cast<void*>(this), Name,
-                        SectionBase, SectionEnd);
+      {
+        static std::atomic<uint32_t> XinsLogs {0};
+        if (XinsLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
+          LogMan::Msg::EFmt("[iOS-xins] tracker={} {} sec={:#x}-{:#x}", static_cast<void*>(this), Name, SectionBase, SectionEnd);
+        }
+      }
       LastExecutableSectionEnd = std::max(LastExecutableSectionEnd, SectionEnd);
       if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
         LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", SectionBase, SectionBase + Section->Misc.VirtualSize);
@@ -417,9 +426,8 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
                           CapMod ? CapMod : "(null)");
       }
     }
-    if (!CapRVA || !*CapRVA) {
-      CapRVA = "0x4db25b"; // mono-2.0-bdwgc.dll: mov byte ptr [rcx+2], al
-    }
+    /* Audit 2026-10-18: this used to default to mono-2.0-bdwgc.dll+0x4db25b, which armed
+     * the capture (and its host-code dumps) in every Unity Mono game. Opt-in only now. */
     if (CapRVA && *CapRVA) {
       if (!CapMod || !*CapMod) {
         CapMod = "mono-2.0-bdwgc.dll";
@@ -470,8 +478,13 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
-    LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                      SectionBase, SectionBase + SectionSize);
+    {
+      static std::atomic<uint32_t> XremSecLogs {0};
+      if (XremSecLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this), SectionBase,
+                          SectionBase + SectionSize);
+      }
+    }
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
   }
