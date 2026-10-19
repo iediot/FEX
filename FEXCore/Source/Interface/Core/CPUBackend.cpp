@@ -319,6 +319,12 @@ namespace CPU {
     Ptrs.IndexedNamedVectorConstantPointers[FEXCore::IR::IndexNamedVectorConstant::INDEXED_NAMED_VECTOR_PBLENDW] =
       reinterpret_cast<uint64_t>(PBLENDW_LUT.data());
 
+    {
+      // MADEIRA: one lock word per emulator instance for AtomicSwap's split slow path.
+      alignas(64) static uint32_t SplitSwapLockWord {};
+      Ptrs.SplitSwapLock = reinterpret_cast<uint64_t>(&SplitSwapLockWord);
+    }
+
 #ifndef FEX_DISABLE_TELEMETRY
     // Fill in telemetry values
     for (size_t i = 0; i < FEXCore::Telemetry::TYPE_LAST; ++i) {

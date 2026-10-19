@@ -355,6 +355,9 @@ struct JITPointers {
   uint64_t LUDIV {};
   uint64_t LDIV {};
   uint64_t ThunkCallbackRet {};
+  // MADEIRA: process-wide lock word for x86 XCHG on a value that straddles a 16-byte
+  // boundary (AtomicSwap's in-JIT slow path; the LSE swap faults there every time).
+  uint64_t SplitSwapLock {};
 
   // Handles returning/calling ARM64EC code from the JIT, expects the target PC in TMP3
   uint64_t ExitFunctionEC {};

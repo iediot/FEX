@@ -164,6 +164,42 @@ DEF_OP(AtomicSwap) {
                                                           ARMEmitter::SubRegSize::i8Bit;
 
   if (CTX->HostFeatures.SupportsAtomics) {
+#ifdef FEX_IOS_HOST
+    /* MADEIRA: x86 XCHG on a value that straddles a 16-byte boundary is legal (a split
+     * lock); an LSE swap there takes an alignment fault on EVERY execution, which the
+     * Mach handler emulates and cannot back-patch. Bad North's island generation ran one
+     * such xchg ~65,000 times a second (16M faults in 4 minutes, one core in the
+     * exception thread). Test the address first, without touching NZCV (the guest's
+     * flags live there): (addr & 15) + size - 1 >= 16 <=> bit 4. The split case swaps
+     * under a process-wide lock with plain unaligned loads/stores, fenced like XCHG. */
+    if (OpSize != IR::OpSize::i8Bit) {
+      ARMEmitter::ForwardLabel Split;
+      ARMEmitter::ForwardLabel Done;
+      ARMEmitter::BackwardLabel Spin;
+      and_(ARMEmitter::Size::i64Bit, TMP1, MemSrc, 15);
+      add(ARMEmitter::Size::i64Bit, TMP1, TMP1, IR::OpSizeToSize(OpSize) - 1);
+      (void)tbnz(TMP1, 4, &Split);
+      ldswpal(SubEmitSize, Src, GetReg(Node), MemSrc);
+      (void)b(&Done);
+
+      (void)Bind(&Split);
+      ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SplitSwapLock));
+      (void)Bind(&Spin);
+      ldaxr(ARMEmitter::SubRegSize::i32Bit, TMP2, TMP1);
+      (void)cbnz(ARMEmitter::Size::i32Bit, TMP2, &Spin);
+      movz(ARMEmitter::Size::i32Bit, TMP2, 1);
+      stxr(ARMEmitter::SubRegSize::i32Bit, TMP3, TMP2, TMP1);
+      (void)cbnz(ARMEmitter::Size::i32Bit, TMP3, &Spin);
+      dmb(ARMEmitter::BarrierScope::ISH);
+      ldr(SubEmitSize, TMP2, MemSrc);
+      str(SubEmitSize, Src, MemSrc);
+      dmb(ARMEmitter::BarrierScope::ISH);
+      stlr(ARMEmitter::WReg::zr, TMP1);
+      ubfm(EmitSize, GetReg(Node), TMP2, 0, IR::OpSizeAsBits(OpSize) - 1);
+      (void)Bind(&Done);
+      return;
+    }
+#endif
     ldswpal(SubEmitSize, Src, GetReg(Node), MemSrc);
   } else {
     ARMEmitter::BackwardLabel LoopTop;
