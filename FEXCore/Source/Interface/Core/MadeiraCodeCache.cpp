@@ -57,6 +57,11 @@ int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* Size, uint64
 uint64_t IosSubfloorToReal(uint64_t Addr);
 }
 
+#ifdef FEX_IOS_HOST
+// The TEB's TSD slot offset this launch (Arm64Emitter.cpp; set by the ARM64EC/WOW64 module at init).
+extern "C" uint32_t IosTebTsdOffset;
+#endif
+
 namespace FEXCore::MadeiraCache {
 std::atomic<int> g_State {-1};
 std::atomic<bool> g_WorkPending {false};
@@ -305,6 +310,12 @@ uint64_t ComputeConfigHash(FEXCore::Context::ContextImpl* CTX) {
   H.Mix(FEXCore::Config::Get_HOSTFEATURES()());
   H.Mix(FEXCore::Config::Get_FORCESVEWIDTH()());
   H.Mix(FEXCore::Config::Get_HALFBARRIERTSOENABLED()());
+#ifdef FEX_IOS_HOST
+  // The TEB's TSD slot is chosen per launch (0x918/0x920/0x928 seen) and every block that reads the
+  // TEB embeds it (Arm64Emitter / Dispatcher `ldr x, [tsd, #IosTebTsdOffset]`). A cache written under
+  // another slot read NULL as the TEB: the Rockstar Games Launcher faulted at TEB+0x1788 on start.
+  H.Mix(uint64_t(::IosTebTsdOffset));
+#endif
   const auto& F = CTX->HostFeatures;
   for (auto V : {F.DCacheLineSize, F.ICacheLineSize}) {
     H.Mix(V);

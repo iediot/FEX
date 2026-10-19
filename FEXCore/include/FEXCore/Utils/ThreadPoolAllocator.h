@@ -15,6 +15,33 @@
 #include <optional>
 #include <type_traits>
 
+/* iOS-Madeira pns2 (pool null-safety): a failed pooled claim recovers or ends the process with a clear
+ * message; it never hands out a buffer whose Ptr is NULL.
+ *
+ * In the iOS ARM64EC module FEXCore::Allocator::VirtualAlloc returns nullptr once the host-only FEX
+ * arena is exhausted (AllocatorHooks.h, ml799), and ClaimBufferImpl recorded that nullptr as a claimed
+ * buffer. DualIntrusiveAllocatorThreadPool then set List = nullptr + 8 MiB and
+ * IREmitter::ResetWorkingList stored to 0x800010 (AV at libarm64ecfex.dll+0xfe770). The Frontend
+ * decoder buffer and the JIT temp buffer take the same unchecked path.
+ *
+ * On by default only in the iOS ARM64EC module. -DFEX_IOS_POOL_NULL_SAFETY=0 opts out; =1 opts another
+ * build in. With it off, this header compiles to exactly the code it had before. */
+#ifndef FEX_IOS_POOL_NULL_SAFETY
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+#define FEX_IOS_POOL_NULL_SAFETY 1
+#else
+#define FEX_IOS_POOL_NULL_SAFETY 0
+#endif
+#endif
+
+#if FEX_IOS_POOL_NULL_SAFETY
+#include <thread>
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+// The same declaration as JIT.cpp's ml460 one (JIT.cpp includes this header, so it must match exactly).
+extern "C" int32_t NtTerminateProcess(void* ProcessHandle, int32_t ExitStatus);
+#endif
+#endif
+
 namespace FEXCore::Utils {
 /**
  * @brief An intrusive thread pool allocator
@@ -113,6 +140,11 @@ public:
   ContainerType::iterator ClaimBuffer(size_t Size, BufferOwnedFlag* CurrentClientFlag) {
     std::unique_lock lk {AllocationMutex};
     auto Buffer = ClaimBufferImpl(Size);
+#if FEX_IOS_POOL_NULL_SAFETY
+    if (Buffer == ClaimedBuffers.end()) {
+      Buffer = ClaimBufferAfterAllocFailure(lk, Size);
+    }
+#endif
     (*Buffer)->CurrentClientOwnedFlag = CurrentClientFlag;
     CurrentClientFlag->store(ClientFlags::FLAG_OWNED);
     return Buffer;
@@ -204,7 +236,17 @@ public:
   constexpr static std::chrono::duration DURATION {std::chrono::seconds(5)};
 
 protected:
+#if FEX_IOS_POOL_NULL_SAFETY
+  IntrusivePooledAllocator() {
+    // One line per process, so a device log shows that this build carries pns2.
+    static std::atomic<bool> Announced {};
+    if (!Announced.exchange(true, std::memory_order_relaxed)) {
+      LogMan::Msg::IFmt("[pool-null] armed: a failed pool claim reclaims, retries, then ends the process rev=pns2");
+    }
+  }
+#else
   IntrusivePooledAllocator() = default;
+#endif
 
   ContainerType::iterator ClaimBufferImpl(size_t Size) {
     auto BuffersEnd = UnclaimedBuffers.end();
@@ -292,8 +334,131 @@ protected:
 
     // Need to allocate a new buffer, couldn't fit
     auto Data = Alloc(Size);
+#if FEX_IOS_POOL_NULL_SAFETY
+    if (!Data) {
+      // Never record a NULL buffer. Take back what idle clients hold, then try the allocation once more.
+      if (auto Reclaimed = EmergencyReclaimLocked(Size); Reclaimed != ClaimedBuffers.end()) {
+        static std::atomic<uint32_t> Reuses {};
+        const uint32_t Reuse = Reuses.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (Reuse <= 8 || (Reuse % 1024) == 0) {
+          LogMan::Msg::EFmt("[pool-null] {} allocation of {:#x} bytes failed; reusing an idle thread's buffer (reuse {}) rev=pns2",
+                            PoolName(), Size, Reuse);
+        }
+        return Reclaimed;
+      }
+      Data = Alloc(Size);
+      if (!Data) {
+        return ClaimedBuffers.end();
+      }
+    }
+#endif
     return ClaimedBuffers.emplace(ClaimedBuffers.end(), new MemoryBuffer {Data, Size, ClockType::now()});
   }
+
+#if FEX_IOS_POOL_NULL_SAFETY
+  /**
+   * @brief Called with AllocationMutex held after Alloc(Size) failed: take back every buffer no client is using
+   *
+   * The expiry pass in ClaimBufferImpl only takes disowned buffers that have been idle for DURATION. That wait
+   * is a reuse heuristic, not a safety requirement: the DISOWNED -> FREE compare-exchange below is the same
+   * handshake, so a client that re-owns first keeps its buffer, and one that loses sees FLAG_FREE and claims anew.
+   *
+   * @return A claimed buffer of at least Size. Otherwise ClaimedBuffers.end(), after every unclaimed buffer
+   * has been released so that its address space can satisfy the next allocation.
+   */
+  ContainerType::iterator EmergencyReclaimLocked(size_t Size) {
+    for (auto it = ClaimedBuffers.begin(); it != ClaimedBuffers.end();) {
+      ClientFlags Expected = ClientFlags::FLAG_DISOWNED;
+      if ((*it)->CurrentClientOwnedFlag->compare_exchange_strong(Expected, ClientFlags::FLAG_FREE)) {
+        (*it)->CurrentClientOwnedFlag = nullptr;
+        UnclaimedBuffers.emplace_back(*it);
+        it = ClaimedBuffers.erase(it);
+        continue;
+      }
+      ++it;
+    }
+
+    // Smallest unclaimed buffer that fits.
+    auto Fit = UnclaimedBuffers.end();
+    for (auto it = UnclaimedBuffers.begin(); it != UnclaimedBuffers.end(); ++it) {
+      if ((*it)->Size >= Size && (Fit == UnclaimedBuffers.end() || (*it)->Size < (*Fit)->Size)) {
+        Fit = it;
+      }
+    }
+
+    if (Fit != UnclaimedBuffers.end()) {
+      MemoryBuffer* Buffer = *Fit;
+      UnclaimedBuffers.erase(Fit);
+      return ClaimedBuffers.emplace(ClaimedBuffers.end(), Buffer);
+    }
+
+    // Nothing fits: release them all.
+    for (auto it : UnclaimedBuffers) {
+      Free(it->Ptr, it->Size);
+      delete it;
+    }
+    UnclaimedBuffers.clear();
+    return ClaimedBuffers.end();
+  }
+
+  /**
+   * @brief Called with AllocationMutex held (through lk) when ClaimBufferImpl could not produce a buffer
+   *
+   * Sleeps with the mutex released so other threads can finish with, disown, unclaim or free their buffers,
+   * and retries for a little longer than DURATION. If that fails, it logs and terminates the process rather
+   * than return a buffer that would be written through at NULL.
+   *
+   * @return A claimed buffer, with lk locked again. Never returns ClaimedBuffers.end().
+   */
+  ContainerType::iterator ClaimBufferAfterAllocFailure(std::unique_lock<std::mutex>& lk, size_t Size) {
+    constexpr auto RetrySleep = std::chrono::milliseconds(50);
+    constexpr auto RetryWindow = std::chrono::duration_cast<std::chrono::milliseconds>(DURATION + std::chrono::seconds(1));
+
+    // Bound the log under a storm of failing threads; the fatal line below is always written.
+    static std::atomic<uint32_t> Events {};
+    const uint32_t Event = Events.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool Report = Event <= 32 || (Event % 256) == 0;
+    if (Report) {
+      LogMan::Msg::EFmt("[pool-null] {} claim of {:#x} bytes failed: the allocation returned NULL and no idle buffer "
+                        "fits; retrying for up to {} ms (event {}) rev=pns2",
+                        PoolName(), Size, RetryWindow.count(), Event);
+    }
+
+    const auto Start = ClockType::now();
+    uint32_t Attempts {};
+    do {
+      lk.unlock();
+      std::this_thread::sleep_for(RetrySleep);
+      lk.lock();
+      ++Attempts;
+      auto Buffer = ClaimBufferImpl(Size);
+      if (Buffer != ClaimedBuffers.end()) {
+        if (Report) {
+          LogMan::Msg::EFmt("[pool-null] {} claim of {:#x} bytes recovered after {} retries (event {}) rev=pns2", PoolName(), Size,
+                            Attempts, Event);
+        }
+        return Buffer;
+      }
+    } while (ClockType::now() - Start < RetryWindow);
+
+    // Let the other threads of this process keep using the pool while this one dies.
+    lk.unlock();
+    LogMan::Msg::EFmt("[pool-null] FATAL: {} could not get {:#x} bytes after {} retries over {} ms; the FEX host arena is "
+                      "exhausted. Terminating the process (STATUS_NO_MEMORY) instead of writing through a NULL buffer "
+                      "(event {}) rev=pns2",
+                      PoolName(), Size, Attempts, RetryWindow.count(), Event);
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+    /* Not an exception. One raised here (ForcedAssert's hlt, as ERROR_AND_DIE does) is delivered to the guest
+     * while this thread still holds the shared CodeInvalidationMutex: the guest's vectored handlers run, their
+     * code is compiled under delivery (UNPUB-COMPILE), that compile needs this same exhausted pool, and the
+     * thread recurses into this wait again, 6 s per level, with the process's JIT frozen. This is the ml460
+     * situation (JIT.cpp, IosCountUnpubBailOrTerminate): at exhaustion the process cannot deliver its own
+     * exception, so end it. */
+    NtTerminateProcess(reinterpret_cast<void*>(-1), static_cast<int32_t>(0xC0000017)); // STATUS_NO_MEMORY
+#endif
+    ERROR_AND_DIE_FMT("[pool-null] {} exhausted ({:#x} bytes) rev=pns2", PoolName(), Size);
+  }
+#endif
 
   void UnclaimBufferImpl(ContainerType::iterator Buffer) {
     (*Buffer)->CurrentClientOwnedFlag = nullptr;
@@ -331,7 +496,29 @@ protected:
    */
   std::mutex AllocationMutex;
 
+#if FEX_IOS_POOL_NULL_SAFETY
+  /**
+   * @brief VirtualAlloc reports failure as nullptr on Windows and as MAP_FAILED elsewhere
+   */
+  static bool VirtualAllocFailed(const void* Ptr) {
+#ifdef _WIN32
+    return Ptr == nullptr;
+#else
+    return Ptr == nullptr || Ptr == MAP_FAILED;
+#endif
+  }
+#endif
+
 private:
+#if FEX_IOS_POOL_NULL_SAFETY
+  /**
+   * @brief Name used in the pns2 diagnostics
+   */
+  virtual const char* PoolName() const {
+    return "FEXMem_pool";
+  }
+#endif
+
   /**
    * @brief Allocates the buffer
    *
@@ -384,8 +571,19 @@ public:
   }
 
 private:
+#if FEX_IOS_POOL_NULL_SAFETY
+  const char* PoolName() const override {
+    return Name ? Name : "FEXMem_pool";
+  }
+#endif
+
   void* Alloc(size_t Size) override {
     auto Result = FEXCore::Allocator::VirtualAlloc(Size);
+#if FEX_IOS_POOL_NULL_SAFETY
+    if (VirtualAllocFailed(Result)) {
+      return nullptr;
+    }
+#endif
     if (Name) {
       FEXCore::Allocator::VirtualName(Name, Result, Size);
     }
@@ -415,8 +613,20 @@ public:
   }
 
 private:
+#if FEX_IOS_POOL_NULL_SAFETY
+  const char* PoolName() const override {
+    return Name ? Name : "FEXMem_pool";
+  }
+#endif
+
   void* Alloc(size_t Size) override {
     auto Ptr = FEXCore::Allocator::VirtualAlloc(Size);
+#if FEX_IOS_POOL_NULL_SAFETY
+    // Without this, the guard page below would be set at NULL + Size, on whatever happens to be mapped there.
+    if (VirtualAllocFailed(Ptr)) {
+      return nullptr;
+    }
+#endif
     uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
     if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
                                             FEXCore::Allocator::ProtectOptions::None)) {
