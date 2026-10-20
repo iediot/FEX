@@ -799,7 +799,6 @@ public:
   void VPFCMPOp(OpcodeArgs, uint8_t CompType);
   void PI2FWOp(OpcodeArgs);
   void PF2IWOp(OpcodeArgs);
-  void PF2IDOp(OpcodeArgs);
 
   void PMULHRWOp(OpcodeArgs);
 
