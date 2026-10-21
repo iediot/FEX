@@ -236,8 +236,8 @@ void VirtualName(const char* Name, const void* Ptr, size_t Size) {
    * FEXMemJIT, FEXMem_Misc, FEXMem -- so emit name+range and the bogus RIP can be matched to
    * a named structure offline, with no further device runs.
    *
-   * This replaces a no-op, so it cannot change behaviour. Capped so a per-thread allocation
-   * pattern cannot storm the log. */
+   * Capped so a per-thread allocation pattern cannot storm the log. The unix side also keeps
+   * the named CodeBuffer ranges for lock-free performance classification. */
   {
     static std::atomic<uint32_t> NameCount {0};
     if (NameCount.fetch_add(1) < 256) {
@@ -245,6 +245,12 @@ void VirtualName(const char* Name, const void* Ptr, size_t Size) {
                         reinterpret_cast<uintptr_t>(Ptr) + Size, Size);
     }
   }
+  FEXUnixLib_SetVMAName Args {
+    .Addr = Ptr,
+    .Size = Size,
+    .Name = Name,
+  };
+  Call(FEXUnixLibFunctions::SetVMAName, &Args);
   return;
 #endif
   if (!SupportsVirtualName) {
