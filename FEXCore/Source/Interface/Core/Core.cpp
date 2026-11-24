@@ -1145,12 +1145,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          // Guest window: snapshotting the guest's code bytes is a guest read. The address handed to
+          // Compare against the bytes the decoder read, not a second read of guest memory: code
+          // rewritten between the two reads (HotSpot's `jmp $` placeholder replaced by the final jump
+          // while a thread was translating it) would be checked against its new bytes but run as the
+          // old instruction, and the self-loop never saw the change. The address handed to
           // _ValidateCode below stays guest; DEF_OP(ValidateCode) applies the window itself.
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(GetGuestBase() + Block.Entry + BlockInstructionsLength);
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           std::array<uint8_t, 0x10> CodeOriginal;
-          memcpy(CodeOriginal.data(), ExistingCodePtr, DecodedInfo->InstSize);
+          memcpy(CodeOriginal.data(), DecodedInfo->InstBytes, DecodedInfo->InstSize);
           auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CodeOriginal, InstAddressReg, DecodedInfo->InstSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
